@@ -161,11 +161,23 @@ preflight() {
 # --------------------------------------------------------------------------
 # Source
 # --------------------------------------------------------------------------
+# The files the installer needs when there is no checkout. Deliberately a
+# short explicit list fetched from raw.githubusercontent.com rather than a
+# source tarball: codeload/archive endpoints are blocked by some corporate and
+# ISP proxies, while raw file fetches go through the same CDN as the installer
+# itself — if you could download this script, you can download these.
+readonly SOURCE_FILES=(
+    "src/lib/log.sh"
+    "src/lib/cloudflare.sh"
+    "src/lib/dsm.sh"
+    "src/bin/syno-letsencrypt"
+)
+
 obtain_source() {
     local here
     here="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" 2>/dev/null && pwd || echo "")"
 
-    # Running from a checkout — use it, so development does not need a push.
+    # Running from a checkout — use it, so development needs no push.
     if [ -n "${here}" ] && [ -f "${here}/src/lib/cloudflare.sh" ]; then
         SRC_DIR="${here}"
         ok "using the local checkout at ${here}"
@@ -176,14 +188,23 @@ obtain_source() {
     bold "Downloading syno-letsencrypt (${REF})"
     rule
     CLEANUP_DIR="$(mktemp -d)"
-    if ! curl -fsSL "https://codeload.github.com/${REPO}/tar.gz/${REF}" \
-            | tar -xz -C "${CLEANUP_DIR}" --strip-components=1; then
-        say ""
-        die "Could not download the source from github.com/${REPO} (ref ${REF}).
-       If the repository is private, clone it and run ./install.sh instead."
-    fi
     SRC_DIR="${CLEANUP_DIR}"
-    ok "downloaded"
+
+    local f url
+    for f in "${SOURCE_FILES[@]}"; do
+        url="https://raw.githubusercontent.com/${REPO}/${REF}/${f}"
+        mkdir -p "${SRC_DIR}/$(dirname "${f}")"
+        if ! curl -fsSL --max-time 30 -o "${SRC_DIR}/${f}" "${url}"; then
+            say ""
+            die "Could not download ${f} from github.com/${REPO} (ref ${REF}).
+       If the repository is private, clone it and run ./install.sh instead."
+        fi
+        # A proxy or captive portal returning an HTML error page with HTTP 200
+        # would otherwise be sourced as shell. Cheap sanity check.
+        head -n1 "${SRC_DIR}/${f}" | grep -q '^#' \
+            || die "${f} does not look like a shell script. Something is intercepting the download."
+    done
+    ok "downloaded ${#SOURCE_FILES[@]} files"
     say ""
 }
 
