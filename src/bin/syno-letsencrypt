@@ -1,56 +1,59 @@
 #!/usr/bin/env bash
 #
-# syno-letsencrypt — Let's Encrypt certificates for Synology DSM, issued over
-# the Cloudflare DNS-01 challenge and installed through DSM's own Web API.
+# syno-letsencrypt — Let's Encrypt certificates for Synology DSM, over the
+# Cloudflare DNS-01 challenge, installed straight into DSM.
 #
 # Subcommands:
-#   check    Validate configuration, Cloudflare token and DSM login. Changes nothing.
+#   check    Validate the Cloudflare token and DSM access. Changes nothing.
 #   issue    Obtain a certificate and install it into DSM.
-#   renew    Renew if within the window, install only if it actually changed.
-#   status   Show configuration and certificate expiry.
+#   renew    Renew if within the window; install only if it actually changed.
+#   status   Show configuration, expiry, and when the next run is due.
+#
+# Runs as root. Installed by install.sh; the systemd timer calls `renew`.
 #
 set -euo pipefail
 
-SELF_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+SELF_DIR="$(cd -- "$(dirname -- "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 readonly SELF_DIR
-readonly LIB_DIR="${SELF_DIR}/../lib"
+readonly LIB_DIR="${SYNOLE_LIB_DIR:-${SELF_DIR}/../share/syno-letsencrypt/lib}"
 
 # shellcheck source=../lib/log.sh
 . "${LIB_DIR}/log.sh"
 # shellcheck source=../lib/cloudflare.sh
 . "${LIB_DIR}/cloudflare.sh"
-# shellcheck source=../lib/dsm-api.sh
-. "${LIB_DIR}/dsm-api.sh"
+# shellcheck source=../lib/dsm.sh
+. "${LIB_DIR}/dsm.sh"
 
-# --------------------------------------------------------------------------
-# Configuration — all environment, because this runs as a container.
-# --------------------------------------------------------------------------
-DATA="${SYNOLE_DATA:-/data}"
-readonly LEGO_DATA="${DATA}/lego"
-readonly STATE="${DATA}/state"
+readonly CONFIG_DIR="${SYNOLE_CONFIG_DIR:-/usr/local/etc/syno-letsencrypt}"
+readonly CONFIG="${CONFIG_DIR}/config"
+readonly LEGO_DATA="${CONFIG_DIR}/lego"
+readonly LEGO_BIN="${SYNOLE_LEGO_BIN:-/usr/local/bin/lego}"
+readonly STATE="${CONFIG_DIR}/last-install"
 
-# Declared here so the linter and the reader both know these come from the
-# container environment, and so an unset one fails loudly rather than silently.
-CLOUDFLARE_DNS_API_TOKEN="${CLOUDFLARE_DNS_API_TOKEN:-}"
-DSM_URL="${DSM_URL:-}"
-DSM_USERNAME="${DSM_USERNAME:-}"
-DSM_PASSWORD="${DSM_PASSWORD:-}"
+# Defaults; the config file overrides them.
+CLOUDFLARE_DNS_API_TOKEN=""
+DOMAINS=""
+ACME_EMAIL=""
+STAGING="false"
+SET_DEFAULT="true"
+RENEW_DAYS="30"
+DNS_RESOLVERS="1.1.1.1:53 8.8.8.8:53"
 
-DOMAINS="${DOMAINS:-}"
-ACME_EMAIL="${ACME_EMAIL:-}"
-STAGING="${STAGING:-false}"
-SET_DEFAULT="${SET_DEFAULT:-true}"
-RENEW_DAYS="${RENEW_DAYS:-30}"
-
-# How DSM identifies this certificate. Renewals match on it so they replace the
-# existing entry rather than adding one every 60 days. Configurable in case a
-# NAS runs more than one instance.
-# Kept in its own variable: an apostrophe inside ${VAR:-default} is legal but
-# reads as an unterminated quote to both humans and linters.
+# How DSM labels this certificate in Control Panel. Renewals match on it, so
+# they replace the existing entry rather than adding a new one every 60 days.
 DEFAULT_CERT_DESC="Let's Encrypt (syno-letsencrypt)"
-CERT_DESC="${CERT_DESC:-${DEFAULT_CERT_DESC}}"
+CERT_DESC="${DEFAULT_CERT_DESC}"
 
-# primary_domain — first entry in DOMAINS, wildcard prefix stripped.
+load_config() {
+    [ -r "${CONFIG}" ] || die "Not configured. Run the installer first: sudo ./install.sh"
+    # shellcheck disable=SC1090
+    . "${CONFIG}"
+    [ -n "${DOMAINS}" ]                  || die "No domains set in ${CONFIG}"
+    [ -n "${CLOUDFLARE_DNS_API_TOKEN}" ] || die "No Cloudflare token set in ${CONFIG}"
+}
+
+# primary_domain — first entry in DOMAINS, wildcard prefix stripped. This is
+# what the zone is looked up by, and what lego names the certificate files after.
 primary_domain() {
     local first="${DOMAINS%%,*}"
     first="${first# }"; first="${first% }"
@@ -58,30 +61,22 @@ primary_domain() {
 }
 
 # --------------------------------------------------------------------------
-# check
-# --------------------------------------------------------------------------
 cmd_check() {
+    load_config
     local failed=0
 
-    log_info "--- Configuration ---"
     log_info "Domains:     ${DOMAINS}"
-    log_info "ACME email:  ${ACME_EMAIL}"
     log_info "Environment: $([ "${STAGING}" = "true" ] && echo 'STAGING (test certificates)' || echo production)"
-    log_info "DSM:         ${DSM_URL:-<unset>} as ${DSM_USERNAME:-<unset>}"
     log_info ""
 
-    log_info "--- Cloudflare ---"
     cf_check_token "${CLOUDFLARE_DNS_API_TOKEN}" "$(primary_domain)" >/dev/null || failed=1
     log_info ""
 
-    log_info "--- DSM ---"
-    if dsm_login; then
-        # Listing certificates is the cheapest call that proves the account is
-        # genuinely an administrator — the usual misconfiguration.
-        dsm_find_cert_id "${CERT_DESC}" >/dev/null \
-            && log_info "DSM account can manage certificates."
-        dsm_logout
+    log_info "Checking DSM access..."
+    if dsm_preflight 2>/dev/null; then
+        log_info "Running as root, and DSM's certificate API is reachable."
     else
+        log_error "Cannot reach DSM's certificate API. Are you running as root?"
         failed=1
     fi
 
@@ -89,13 +84,11 @@ cmd_check() {
     if [ "${failed}" -eq 0 ]; then
         log_info "All checks passed."
     else
-        log_error "One or more checks failed."
+        log_error "Checks failed."
     fi
     return "${failed}"
 }
 
-# --------------------------------------------------------------------------
-# issue / renew
 # --------------------------------------------------------------------------
 run_lego() {
     local action="$1"; shift
@@ -119,17 +112,22 @@ run_lego() {
     [ "${STAGING}" = "true" ] \
         && lego_args+=(--server https://acme-staging-v02.api.letsencrypt.org/directory)
 
-    # lego finds a domain's zone apex with SOA queries against the system
-    # resolver. On a network running Pi-hole, AdGuard or split-horizon DNS that
-    # walk fails, and the error it produces reads like a credentials problem.
-    # Pinning public resolvers for the challenge lookup removes the whole class.
-    for r in ${DNS_RESOLVERS:-1.1.1.1:53 8.8.8.8:53}; do
+    # lego finds a domain's zone apex with SOA queries through the system
+    # resolver. On a network running Pi-hole, AdGuard, split-horizon DNS, or a
+    # router that hijacks port 53, that walk fails — and the error it produces
+    # reads like a credentials problem, which sends people debugging the wrong
+    # thing for hours. Pinning public resolvers for the challenge lookup removes
+    # the whole failure class.
+    for r in ${DNS_RESOLVERS}; do
         lego_args+=(--dns.resolvers "${r}")
     done
 
     mkdir -p "${LEGO_DATA}"
+    chmod 700 "${LEGO_DATA}"
+
     log_info "lego ${action}: ${DOMAINS}"
-    CLOUDFLARE_DNS_API_TOKEN="${CLOUDFLARE_DNS_API_TOKEN}" lego "${lego_args[@]}" "${action}" "$@"
+    CLOUDFLARE_DNS_API_TOKEN="${CLOUDFLARE_DNS_API_TOKEN}" \
+        "${LEGO_BIN}" "${lego_args[@]}" "${action}" "$@"
 }
 
 # cert_paths — prints "<cert> <key> <chain>".
@@ -147,33 +145,36 @@ install_into_dsm() {
     read -r cert key chain <<<"$(cert_paths)"
     [ -f "${cert}" ] || die "No certificate at ${cert}"
 
-    # lego writes cert.crt as leaf + chain. DSM wants the leaf alone, so hand it
-    # just the first certificate rather than a bundle.
+    # lego writes cert.crt as leaf + chain. DSM wants the leaf on its own, so
+    # give it just the first certificate rather than a bundle.
     leaf="$(mktemp)"
     # shellcheck disable=SC2064  # expand now, deliberately
     trap "rm -f '${leaf}'" EXIT
     openssl x509 -in "${cert}" -out "${leaf}"
 
-    dsm_login || return 1
     dsm_import_cert "${leaf}" "${key}" "${chain}" "${CERT_DESC}" "${SET_DEFAULT}"
-    dsm_logout
+    date -u '+%Y-%m-%dT%H:%M:%SZ' > "${STATE}"
 }
 
 cmd_issue() {
+    load_config
+    dsm_require_root issue
     run_lego run
     install_into_dsm
-    mkdir -p "${STATE}"
-    date -u '+%Y-%m-%dT%H:%M:%SZ' > "${STATE}/last-install"
-    log_info "Certificate issued and installed."
+    log_info "Done."
 }
 
 cmd_renew() {
+    load_config
+    dsm_require_root renew
+
     local cert before after
     read -r cert _ _ <<<"$(cert_paths)"
 
     if [ ! -f "${cert}" ]; then
         log_info "No certificate yet; issuing for the first time."
-        cmd_issue
+        run_lego run
+        install_into_dsm
         return
     fi
 
@@ -182,8 +183,9 @@ cmd_renew() {
     read -r cert _ _ <<<"$(cert_paths)"
     after="$(sha256sum "${cert}" | cut -d' ' -f1)"
 
-    # lego exits 0 whether or not it renewed, so compare content. Re-importing
-    # an unchanged certificate would restart DSM's web server daily for nothing.
+    # lego exits 0 whether or not it renewed anything, so compare content.
+    # Re-importing an unchanged certificate would restart DSM's web server
+    # every single day for no reason.
     if [ "${before}" = "${after}" ]; then
         log_info "Certificate is still current; nothing to do."
         return 0
@@ -191,50 +193,54 @@ cmd_renew() {
 
     log_info "Certificate was renewed; installing into DSM."
     install_into_dsm
-    mkdir -p "${STATE}"
-    date -u '+%Y-%m-%dT%H:%M:%SZ' > "${STATE}/last-install"
 }
 
 # --------------------------------------------------------------------------
 cmd_status() {
+    load_config
     local cert
     read -r cert _ _ <<<"$(cert_paths)"
 
     printf 'Domains:      %s\n' "${DOMAINS}"
-    printf 'Environment:  %s\n' "$([ "${STAGING}" = "true" ] && echo staging || echo production)"
-    printf 'DSM:          %s\n' "${DSM_URL:-<unset>}"
+    printf 'Environment:  %s\n' "$([ "${STAGING}" = "true" ] && echo 'staging (test certificates)' || echo production)"
+    printf 'Config:       %s\n' "${CONFIG}"
 
     if [ ! -f "${cert}" ]; then
         printf 'Certificate:  not yet issued\n'
         return 1
     fi
 
-    printf 'Certificate:  %s\n' "${cert}"
     printf 'Subject:      %s\n' "$(openssl x509 -in "${cert}" -noout -subject | cut -d= -f2-)"
     printf 'Expires:      %s\n' "$(openssl x509 -in "${cert}" -noout -enddate | cut -d= -f2)"
     if openssl x509 -in "${cert}" -noout -checkend $(( RENEW_DAYS * 86400 )) >/dev/null 2>&1; then
-        printf 'Renewal:      not due\n'
+        printf 'Renewal:      not due yet\n'
     else
         printf 'Renewal:      due\n'
     fi
 
-    [ -f "${STATE}/last-install" ] \
-        && printf 'Last install: %s\n' "$(cat "${STATE}/last-install")"
+    [ -f "${STATE}" ] && printf 'Last install: %s\n' "$(cat "${STATE}")"
+
+    if command -v systemctl >/dev/null 2>&1; then
+        printf 'Next run:     %s\n' \
+            "$(systemctl list-timers --no-pager syno-letsencrypt.timer 2>/dev/null \
+               | awk 'NR==2 {print $1, $2, $3, $4}')"
+    fi
     return 0
 }
 
-usage() { sed -n '3,11p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '3,12p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
 
 main() {
     local cmd="${1:-}"
     [ $# -gt 0 ] && shift
+    command -v jq >/dev/null 2>&1 || die "jq is required but not on PATH."
     case "${cmd}" in
         check)  cmd_check "$@" ;;
         issue)  cmd_issue "$@" ;;
         renew)  cmd_renew "$@" ;;
         status) cmd_status "$@" ;;
         -h|--help|help|'') usage ;;
-        *) die "Unknown command: ${cmd}" ;;
+        *) die "Unknown command: ${cmd}. Try --help." ;;
     esac
 }
 

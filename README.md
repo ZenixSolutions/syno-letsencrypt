@@ -1,53 +1,43 @@
 # syno-letsencrypt
 
-Let's Encrypt certificates — including wildcards — for Synology DSM 7, issued
-over the Cloudflare DNS-01 challenge and installed into DSM automatically.
-Runs as a container. No inbound ports, nothing exposed to the internet, and
-nothing on your NAS runs as root.
+```
+   ███████╗███████╗███╗   ██╗██╗██╗  ██╗
+   ╚══███╔╝██╔════╝████╗  ██║██║╚██╗██╔╝
+     ███╔╝ █████╗  ██╔██╗ ██║██║ ╚███╔╝
+    ███╔╝  ██╔══╝  ██║╚██╗██║██║ ██╔██╗
+   ███████╗███████╗██║ ╚████║██║██╔╝ ██╗
+   ╚══════╝╚══════╝╚═╝  ╚═══╝╚═╝╚═╝  ╚═╝
+   S O L U T I O N S
+```
 
-> **Status: in development, not yet run end to end.**
-> The DSM privilege model was measured on real hardware first — see
-> [`docs/findings-dsm-privileges.md`](docs/findings-dsm-privileges.md), which is
-> why this is a container rather than the Package Center package originally
-> planned ([ADR 0004](docs/adr/0004-container-not-package.md)).
+Let's Encrypt certificates — including wildcards — for Synology DSM 7, over the
+Cloudflare DNS-01 challenge, installed straight into DSM and renewed
+automatically.
 
-## Why this exists
+No open ports. No DSM password stored anywhere. One command.
 
-The usual options are a shell script installed over SSH that you re-run by hand,
-or acme.sh with a deploy hook that wants your DSM administrator password and
-breaks when you turn on 2FA. Neither is something you would hand to someone else
-to run.
-
-This is one compose file. Fill in three values, start it, and DSM has a valid
-certificate that renews itself.
-
-## What it does
-
-- **Cloudflare only.** Not a plugin framework with sixty half-maintained DNS
-  providers. One provider, done properly.
-- **Checks before it commits.** At startup it proves the Cloudflare token can
-  list your zone and edit DNS, and that the DSM account can manage certificates
-  — then says exactly which one is wrong if not. A certificate tool that only
-  reveals its misconfiguration sixty days later is worse than no tool.
-- **Installs through DSM's own API.** The same call Control Panel makes when you
-  upload a certificate by hand, so DSM updates every subscribing service and
-  reloads its web server itself. We never reimplement DSM internals.
-- **Touches nothing on the NAS.** No bind mounts, no host capabilities, no root.
-- **Renews unattended**, and only re-imports when the certificate actually
-  changed, so DSM's web server is not restarted for nothing.
+> **Status: in development, not yet run end to end on hardware.**
 
 ## Install
 
-1. Create the DSM account it will use — see [`docs/dsm-account.md`](docs/dsm-account.md).
-2. Create the Cloudflare token (below).
-3. **Container Manager → Project → Create**, and paste
-   [`docker-compose.yml`](docker-compose.yml) with your values filled in.
-4. Leave `STAGING: "true"` for the first run. Check the log, confirm it issued
-   and installed a test certificate, then set it to `"false"` and restart.
+SSH into your NAS and run:
 
-Staging matters: Let's Encrypt allows only five duplicate certificates per week
-in production, and a misconfiguration discovered after burning them means
-waiting.
+```sh
+curl -fsSL https://raw.githubusercontent.com/ZenixSolutions/syno-letsencrypt/main/install.sh | sudo bash
+```
+
+It checks your NAS, downloads `lego`, asks for your Cloudflare token and
+domains, **proves the token works before writing anything**, and schedules a
+daily renewal check.
+
+Prefer to read it first? That's the better instinct:
+
+```sh
+git clone https://github.com/ZenixSolutions/syno-letsencrypt.git
+cd syno-letsencrypt
+less install.sh
+sudo ./install.sh
+```
 
 ## The Cloudflare token
 
@@ -57,58 +47,88 @@ At [dash.cloudflare.com → My Profile → API Tokens](https://dash.cloudflare.c
 | Scope | Resource | Permission | |
 |---|---|---|---|
 | Zone | DNS | Edit | included by the template |
-| Zone | Zone | Read | **you must add this row yourself** |
+| Zone | Zone | **Read** | **you must add this row yourself** |
 
 Under **Zone Resources**, include your domain.
 
-That second row is the one everybody misses. Cloudflare's own template does not
-include `Zone → Read`, and without it the certificate cannot be issued — lego
-has to resolve your domain to a zone ID before it can create the challenge
-record. The container checks for exactly this at startup and says so plainly
-rather than failing later.
+That second row is the one nearly everyone misses. Cloudflare's own template
+doesn't include `Zone → Read`, and without it the certificate can't be issued —
+your domain has to be resolved to a zone ID before the challenge record can be
+created. The installer checks for exactly this and says so plainly, rather than
+failing later with something cryptic.
 
 ## Usage
 
-It renews itself. Everything is also available on demand:
+Renewal is automatic. Everything is also available on demand:
 
 ```sh
-docker exec syno-letsencrypt syno-letsencrypt status   # expiry, next renewal
-docker exec syno-letsencrypt syno-letsencrypt check    # validate config, change nothing
-docker exec syno-letsencrypt syno-letsencrypt renew    # renew now if within 30 days
-docker exec syno-letsencrypt syno-letsencrypt issue    # force a fresh issuance
+sudo syno-letsencrypt status    # expiry and next scheduled run
+sudo syno-letsencrypt check     # re-validate the token, change nothing
+sudo syno-letsencrypt renew     # what the daily timer runs
+sudo syno-letsencrypt issue     # force a fresh issuance
 ```
 
-Logs: Container Manager → Container → `syno-letsencrypt` → Log.
+Configuration lives in `/usr/local/etc/syno-letsencrypt/config` (root-only) and
+is plain shell — edit it directly and re-run `check`.
 
-## What it can reach
+Renewal logs: `journalctl -u syno-letsencrypt`.
 
-| | |
-|---|---|
-| Host mounts | none |
-| Host capabilities | none |
-| Host PID namespace | not used |
-| Runs as root on the NAS | no |
-| Outbound | Cloudflare API, Let's Encrypt, DSM's own API |
+## How it works
 
-The one meaningful cost is the DSM administrator account, because DSM offers no
-narrower permission for managing certificates. [`docs/dsm-account.md`](docs/dsm-account.md)
-covers how to limit it.
+1. `lego` proves you own the domain by creating an `_acme-challenge` TXT record
+   in Cloudflare, then removing it. Nothing inbound is ever opened.
+2. The certificate is handed to DSM through `synowebapi` — the same code path
+   Control Panel uses when you upload one by hand — so DSM writes its own
+   certificate store, copies the certificate to every subscribing service, and
+   reloads its web server itself.
+3. A systemd timer checks daily and renews inside 30 days, re-importing only
+   when the certificate actually changed.
 
-## Building
+Running as root means **no DSM username or password is needed**. The only
+credential stored is the Cloudflare token, at mode `0600`.
+
+DSM 7.3 serves dual ECC and RSA certificates, so `cert.pem` no longer exists in
+`system/default`. Letting DSM own that layout, rather than writing the files
+ourselves, is what keeps this working across DSM releases — details in
+[`docs/findings-dsm-privileges.md`](docs/findings-dsm-privileges.md).
+
+## Uninstall
 
 ```sh
-docker build -t syno-letsencrypt .
+sudo ./uninstall.sh            # keep the certificate and configuration
+sudo ./uninstall.sh --purge    # remove them too
 ```
+
+The certificate already installed in DSM is left alone either way — removing
+this shouldn't drop your NAS back to a self-signed certificate.
+
+## Requirements
+
+- Synology DSM 7.0 or later
+- A domain hosted on Cloudflare
+- SSH access with an account that can `sudo`
+
+## Design notes
+
+This started as a Package Center `.spk`, became a container, and ended up here.
+Both earlier designs were killed by measurements taken on real hardware rather
+than by guesswork: a DSM 7 package cannot get the privilege it needs, and the
+container workaround required a DSM administrator account. A root script has
+neither problem.
+
+- [`docs/findings-dsm-privileges.md`](docs/findings-dsm-privileges.md) — what a
+  DSM 7.3 package is actually allowed to do, measured
+- [`docs/architecture.md`](docs/architecture.md) — how the current design works
+- [`docs/adr/`](docs/adr/) — the decisions, including the two that were reversed
 
 ## Prior art
 
-The DSM certificate-store layout and the `synowebapi` import path were worked out
-by a number of people before us, in particular
-[catchdave/ssl-certs](https://github.com/catchdave/ssl-certs),
+The DSM certificate layout and the `synowebapi` import path were worked out by
+others first, in particular [catchdave/ssl-certs](https://github.com/catchdave/ssl-certs),
 [zaxbux/syno-acme](https://github.com/zaxbux/syno-acme), and
 [JessThrysoee/synology-letsencrypt](https://github.com/JessThrysoee/synology-letsencrypt),
 which was the starting point for this project. This is an independent
-implementation with a different architecture, not a fork of their code.
+implementation, not a fork of their code.
 
 ## Licence
 

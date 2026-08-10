@@ -1,110 +1,127 @@
 # Architecture
 
 ```
-container (unprivileged, no host access)
+sudo syno-letsencrypt renew        (systemd timer, daily)
    |
-   |-- startup: validate Cloudflare token + DSM login, or refuse to start
+   |-- lego --dns cloudflare
+   |        |
+   |        |--> Cloudflare API      create _acme-challenge TXT, then remove it
+   |        `--> Let's Encrypt       DNS-01 validation, issue certificate
    |
-   |-- lego  --dns cloudflare  ------> Cloudflare API   (create _acme-challenge TXT)
-   |                           ------> Let's Encrypt    (DNS-01)
+   |-- certificate actually changed?
+   |        no  -> stop. DSM is not touched, nothing restarts.
+   |        yes -> synowebapi --exec-fastwebapi
+   |                    api=SYNO.Core.Certificate method=import
+   |                        |
+   |                        v
+   |               DSM, in-process as root:
+   |                 writes _archive/<id>/
+   |                 copies to every subscribing service
+   |                 updates INFO / DEFAULT
+   |                 reloads the web server
    |
-   |-- certificate changed?
-   |        yes -> SYNO.Core.Certificate import ------> DSM's Web API
-   |                                                       |
-   |                                                       v
-   |                                            DSM, as root, on its own side:
-   |                                              writes _archive/<id>/
-   |                                              copies to every subscriber
-   |                                              updates INFO / DEFAULT
-   |                                              reloads the web server
-   |
-   `-- sleep 12h, repeat
+   `-- record the timestamp
 ```
 
-## Why a container and not a package
+## Why a root script
 
-Measured on DSM 7.3: a package declaring `run-as: root` is refused at install,
-install scripts run as the unprivileged package user, the certificate store is
-not even readable, and `synowebapi`/`synow3tool` cannot be executed. Full
-results in [findings-dsm-privileges.md](findings-dsm-privileges.md); the
-reasoning in [ADR 0004](adr/0004-container-not-package.md).
+The privilege restrictions that shaped the two earlier designs apply to
+*packages and containers*, not to root. Measured on DSM 7.3, a package cannot
+read the certificate store or execute `synowebapi`, and one declaring root is
+refused at install ([findings](findings-dsm-privileges.md)). A container can
+write the files through a bind mount but cannot reload nginx without a
+container escape.
 
-Obtaining a certificate needs no privilege. Only the handoff to DSM does — and
-the cleanest way to perform a privileged operation is to ask the process that
-already has the privilege.
+A script running as root has none of those problems, and gains something the
+container design had to pay for: it can call `synowebapi` directly, so it needs
+**no DSM credentials at all**. The container had to authenticate over HTTP with
+a DSM administrator password, because it wasn't root. This is root — it just
+asks.
 
-## Why the Web API and not the filesystem
+## Why `synowebapi` and not writing the files
 
-A container with a bind mount **can** write the certificate store — we confirmed
-it, root inside the container, `WRITE: YES`. But nginx loads certificates into
-memory at startup, so new files change nothing until it reloads, and the reload
-tools live on the host. Reaching them requires `privileged: true` plus
-`pid: host` plus `nsenter` into PID 1 — a container escape that grants the
-container total control of the NAS. That is more dangerous than the root
-scheduled task it was supposed to replace, while appearing safer.
+`synowebapi --exec-fastwebapi` invokes DSM's Web API in-process. It is the same
+code path Control Panel uses when a certificate is uploaded by hand, so DSM
+performs the archive write, the per-service copies, the `INFO`/`DEFAULT`
+bookkeeping and the web server reload itself.
 
-Calling DSM's API instead means the container needs no mounts at all. DSM does
-the privileged work on its own side of an authenticated request, exactly as it
-does when a certificate is uploaded through Control Panel — including the
-per-service copies and the reload, which is the part every filesystem-based tool
-has to reimplement and keep in step with DSM releases.
+Writing the PEM files directly is the traditional approach and it has quietly
+broken. On DSM 7.3, `system/default` contains:
 
-The cost is a DSM administrator account. DSM has no service accounts and no
-permission narrower than administrator for certificate management, so this is
-unavoidable rather than chosen. [dsm-account.md](dsm-account.md) covers limiting
-what it can reach.
+```
+ECC-cert.pem  ECC-fullchain.pem  ECC-privkey.pem
+RSA-cert.pem  RSA-fullchain.pem  RSA-privkey.pem
+```
+
+DSM installs an elliptic-curve and an RSA certificate side by side and serves
+whichever the client negotiates. The `cert.pem` / `privkey.pem` /
+`fullchain.pem` filenames that every filesystem-based tool writes **no longer
+exist there**. The layout is undocumented and changed between releases, so DSM
+owns it.
+
+The other option — acme.sh's HTTP deploy hook — needs a DSM administrator
+password, breaks under 2FA, and its unattended workaround disables 2FA
+enforcement DSM-wide while it runs. Running as root, none of that is necessary.
 
 ## Why our own zone lookup, and pinned resolvers
 
 lego finds a domain's zone apex by issuing SOA queries through the system
 resolver. On a network running Pi-hole, AdGuard, split-horizon DNS, or a router
 that hijacks port 53, that walk fails — and the error reads like a credentials
-problem, which sends people debugging the wrong thing for hours. We pin public
-resolvers for the challenge lookup and do our own zone discovery against the
-Cloudflare API, which does not care what the local resolver does.
+problem, which sends people debugging the wrong thing for hours. The challenge
+lookup is pinned to public resolvers, and the installer does its own zone
+discovery against the Cloudflare API, which doesn't care what the local resolver
+does.
 
-Zone discovery also lists all zones rather than filtering server-side.
+Zone discovery lists all zones rather than filtering server-side.
 `GET /zones?name=<domain>` returns HTTP 403 with error code literally `0` when
-the token cannot list zones — indistinguishable from a mistyped domain. Listing
-and matching locally lets us tell the two apart.
+the token can't list zones — indistinguishable from a mistyped domain. Listing
+and matching locally separates the two, so the installer can say which one it is.
 
 ## Why validation is functional
 
 A DNS-scoped Cloudflare token cannot introspect its own permissions: reading its
-own policy set needs `API Tokens Read`, which is User-scoped and absent. So
-"does this token work?" can only be answered by trying. At startup we list zones
-(proving `Zone:Read`), then create and immediately delete a TXT record at
-`_syno-letsencrypt-check.<zone>` (proving `Zone:DNS:Edit`). The name is
-deliberately distinct from `_acme-challenge` so it can never collide with a real
-challenge in flight.
+own policy set needs `API Tokens Read`, a User-scoped permission it does not
+have. So "does this token work?" can only be answered by trying. The installer
+lists zones (proving `Zone:Read`), then creates and immediately deletes a TXT
+record at `_syno-letsencrypt-check.<zone>` (proving `Zone:DNS:Edit`). That name
+is deliberately distinct from `_acme-challenge` so it can never collide with a
+real challenge in flight.
+
+This all happens **before** anything is written to disk. A token that can't do
+the job fails during setup, with the specific missing permission named, rather
+than at 3am sixty days later.
+
+## Why a systemd timer, not cron
+
+DSM rewrites `/etc/crontab` and is strict about its formatting, so cron entries
+there are fragile. DSM 7 is systemd-based; a timer survives reboots cleanly,
+`Persistent=true` catches up a run missed while the NAS was powered off, and
+`RandomizedDelaySec=6h` avoids every NAS on earth hitting Let's Encrypt in the
+same minute.
 
 ## Layout
 
 ```
+install.sh                 interactive installer; also the curl one-liner target
+uninstall.sh               removal, with --purge
 src/bin/syno-letsencrypt   check, issue, renew, status
 src/lib/log.sh             logging, secret redaction
 src/lib/cloudflare.sh      token validation, zone discovery
-src/lib/dsm-api.sh         DSM login and certificate import
-docker/entrypoint.sh       startup validation, renewal loop
-Dockerfile                 alpine + lego, runs as uid 1000
-docker-compose.yml         what the user actually edits
-spk/                       unused; see below
+src/lib/dsm.sh             certificate import via synowebapi
 ```
 
-`spk/` and `build/build-spk.sh` are retained but unused. If a thin package can
-declare the container through the `docker-project` resource worker, the Package
-Center experience becomes possible again with the privileged work still in the
-container. That is untested.
+Installed to:
 
-## State
+| Path | Mode | Contents |
+|---|---|---|
+| `/usr/local/bin/syno-letsencrypt` | 0755 | the CLI |
+| `/usr/local/bin/lego` | 0755 | ACME client |
+| `/usr/local/share/syno-letsencrypt/lib/` | 0644 | libraries |
+| `/usr/local/etc/syno-letsencrypt/` | 0700 | config and lego data |
+| `/usr/local/etc/syno-letsencrypt/config` | 0600 | includes the Cloudflare token |
+| `/etc/systemd/system/syno-letsencrypt.{service,timer}` | 0644 | schedule |
 
-Everything persistent lives in the `/data` volume:
-
-| Path | Contents |
-|---|---|
-| `/data/lego/accounts/` | ACME account key — losing it forces re-registration |
-| `/data/lego/certificates/` | issued certificates |
-| `/data/state/last-install` | timestamp of the last successful DSM import |
-
-Keep the volume. Discarding it burns Let's Encrypt issuance rate limit for no
-reason.
+The ACME account key lives in `/usr/local/etc/syno-letsencrypt/lego/accounts/`.
+Losing it forces re-registration with Let's Encrypt, so `uninstall.sh` keeps it
+unless `--purge` is given.
