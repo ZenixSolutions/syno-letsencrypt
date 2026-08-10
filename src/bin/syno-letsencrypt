@@ -25,6 +25,17 @@ readonly LIB_DIR="${SYNOLE_LIB_DIR:-${SELF_DIR}/../share/syno-letsencrypt/lib}"
 . "${LIB_DIR}/dsm.sh"
 # shellcheck source=../lib/schedule.sh
 . "${LIB_DIR}/schedule.sh"
+# shellcheck source=../lib/ui.sh
+. "${LIB_DIR}/ui.sh"
+
+# One place to undo anything that alters the terminal or leaves files behind.
+# Ctrl-C during the DNS wait would otherwise leave the cursor hidden.
+_TMPFILES=()
+_cleanup() {
+    ui_cursor_restore
+    [ ${#_TMPFILES[@]} -eq 0 ] || rm -f "${_TMPFILES[@]}"
+}
+trap _cleanup EXIT INT TERM
 
 readonly CONFIG_DIR="${SYNOLE_CONFIG_DIR:-/usr/local/etc/syno-letsencrypt}"
 readonly CONFIG="${CONFIG_DIR}/config"
@@ -40,6 +51,11 @@ STAGING="false"
 SET_DEFAULT="true"
 RENEW_DAYS="30"
 DNS_RESOLVERS="1.1.1.1:53 8.8.8.8:53"
+
+# How long to wait for the challenge record to become visible on Cloudflare's
+# nameservers. Set explicitly rather than left to lego's default so the
+# progress display can show a real deadline instead of a guess.
+PROPAGATION_TIMEOUT="180"
 
 # How DSM labels this certificate in Control Panel. Renewals match on it, so
 # they replace the existing entry rather than adding a new one every 60 days.
@@ -131,8 +147,39 @@ run_lego() {
     chmod 700 "${LEGO_DATA}"
 
     log_info "lego ${action}: ${DOMAINS}"
+
+    # Non-interactive (the scheduled task, or output redirected): let lego
+    # write straight through, so the task history and any log capture keep the
+    # full detail.
+    if [ "${UI_TTY}" != true ]; then
+        CLOUDFLARE_DNS_API_TOKEN="${CLOUDFLARE_DNS_API_TOKEN}" \
+        CLOUDFLARE_PROPAGATION_TIMEOUT="${PROPAGATION_TIMEOUT}" \
+            "${LEGO_BIN}" "${lego_args[@]}" "${action}" "$@"
+        return $?
+    fi
+
+    # Interactive: lego prints one identical line every two seconds while it
+    # waits for DNS to propagate — up to ninety of them, none of which say how
+    # far along it is. Capture the output, show progress against the real
+    # deadline, and print the log only if something fails.
+    local log rc
+    log="$(mktemp)"; _TMPFILES+=("${log}")
     CLOUDFLARE_DNS_API_TOKEN="${CLOUDFLARE_DNS_API_TOKEN}" \
-        "${LEGO_BIN}" "${lego_args[@]}" "${action}" "$@"
+    CLOUDFLARE_PROPAGATION_TIMEOUT="${PROPAGATION_TIMEOUT}" \
+        "${LEGO_BIN}" "${lego_args[@]}" "${action}" "$@" >"${log}" 2>&1 &
+
+    ui_progress $! "${log}" "${PROPAGATION_TIMEOUT}"
+    rc=$?
+
+    if [ "${rc}" -ne 0 ]; then
+        log_error "lego failed. Full output:"
+        sed 's/^/    /' "${log}" >&2
+    else
+        # Keep the parts worth seeing; drop the propagation spam.
+        grep -E "Server responded with a certificate|acme: Registering|Obtaining" "${log}" \
+            | sed 's/^/    /' || true
+    fi
+    return "${rc}"
 }
 
 # cert_paths — prints "<cert> <key> <chain>".
@@ -152,9 +199,7 @@ install_into_dsm() {
 
     # lego writes cert.crt as leaf + chain. DSM wants the leaf on its own, so
     # give it just the first certificate rather than a bundle.
-    leaf="$(mktemp)"
-    # shellcheck disable=SC2064  # expand now, deliberately
-    trap "rm -f '${leaf}'" EXIT
+    leaf="$(mktemp)"; _TMPFILES+=("${leaf}")
     openssl x509 -in "${cert}" -out "${leaf}"
 
     # Decide what we are updating. Order matters:

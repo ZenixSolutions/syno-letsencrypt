@@ -285,7 +285,9 @@ readonly SOURCE_FILES=(
     "src/lib/cloudflare.sh"
     "src/lib/dsm.sh"
     "src/lib/schedule.sh"
+    "src/lib/ui.sh"
     "src/bin/syno-letsencrypt"
+    "docs/banner.txt"
 )
 
 obtain_source() {
@@ -315,9 +317,15 @@ obtain_source() {
        If the repository is private, clone it and run ./install.sh instead."
         fi
         # A proxy or captive portal returning an HTML error page with HTTP 200
-        # would otherwise be sourced as shell. Cheap sanity check.
-        head -n1 "${SRC_DIR}/${f}" | grep -q '^#' \
-            || die "${f} does not look like a shell script. Something is intercepting the download."
+        # would otherwise be sourced as shell. Cheap sanity check, skipped for
+        # the ASCII wordmark, which is not a script.
+        case "${f}" in
+            *.sh|*/syno-letsencrypt)
+                head -n1 "${SRC_DIR}/${f}" | grep -q '^#' \
+                    || die "${f} does not look like a shell script. Something is intercepting the download."
+                ;;
+            *) ;;
+        esac
     done
     ok "downloaded ${#SOURCE_FILES[@]} files"
     say ""
@@ -560,6 +568,9 @@ install_files() {
     mkdir -p "${LIB_DIR}" "${CONFIG_DIR}"
     chmod 700 "${CONFIG_DIR}"
     install -m 644 -o root -g root "${SRC_DIR}"/src/lib/*.sh "${LIB_DIR}/"
+    # The CLI draws the wordmark as a progress indicator while waiting for DNS.
+    install -m 644 -o root -g root "${SRC_DIR}/docs/banner.txt" \
+        /usr/local/share/syno-letsencrypt/banner.txt
     install -m 755 -o root -g root "${SRC_DIR}/src/bin/syno-letsencrypt" "${BIN_DIR}/syno-letsencrypt"
     ok "installed ${BIN_DIR}/syno-letsencrypt"
 }
