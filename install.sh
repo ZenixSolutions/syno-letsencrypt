@@ -386,13 +386,22 @@ needs a token that can edit DNS for that one zone — nothing else.
 
   ${C_BOLD}1.${C_RESET} Open  ${C_BLUE}https://dash.cloudflare.com/profile/api-tokens${C_RESET}
   ${C_BOLD}2.${C_RESET} Create Token  →  "Edit zone DNS"  →  Use template
-  ${C_BOLD}3.${C_RESET} ${C_YELLOW}Add a second permission row:${C_RESET}
 
-         Zone   │   Zone   │   Read
+     ${C_DIM}That template gives you one permission row:${C_RESET}
 
-     ${C_DIM}The template only grants Zone → DNS → Edit. Without Zone → Read the
-     certificate cannot be issued, because the domain has to be resolved to a
-     zone ID first. This is the step nearly everyone misses.${C_RESET}
+           Zone   ${C_DIM}(scope)${C_RESET}     DNS    ${C_DIM}(resource)${C_RESET}     Edit   ${C_DIM}(level)${C_RESET}
+
+  ${C_BOLD}3.${C_RESET} ${C_YELLOW}Add a second row, and set the middle dropdown to "Zone":${C_RESET}
+
+           Zone   ${C_DIM}(scope)${C_RESET}     ${C_YELLOW}Zone${C_RESET}   ${C_DIM}(resource)${C_RESET}     Read   ${C_DIM}(level)${C_RESET}
+
+     ${C_DIM}Yes — "Zone" twice. The scope and the resource are both called Zone,
+     which looks like a mistake but is not. This row is what lets the token
+     look up which zone your domain belongs to; without it the certificate
+     cannot be issued.
+
+     Note it is NOT "Zone / DNS / Read" — that would be redundant, since the
+     Edit level above already includes reading.${C_RESET}
 
   ${C_BOLD}4.${C_RESET} Zone Resources  →  Include  →  your domain
   ${C_BOLD}5.${C_RESET} Continue to summary  →  Create Token  →  copy the value

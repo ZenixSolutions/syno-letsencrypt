@@ -109,17 +109,21 @@ Both are official release binaries, installed to `/usr/local/bin`.
 At [dash.cloudflare.com → My Profile → API Tokens](https://dash.cloudflare.com/profile/api-tokens)
 → **Create Token**, start from the **Edit zone DNS** template, then:
 
-| Scope | Resource | Permission | |
+| Scope | Resource | Level | |
 |---|---|---|---|
 | Zone | DNS | Edit | included by the template |
-| Zone | Zone | **Read** | **must be added manually** |
+| Zone | **Zone** | **Read** | **must be added manually** |
 
 Under **Zone Resources**, include the domain the certificate is for.
 
-The second row is a common omission. Cloudflare's "Edit zone DNS" template
-grants only `Zone → DNS → Edit`; without `Zone → Read` the certificate cannot be
-issued, because the domain must be resolved to a zone ID before the challenge
-record can be created.
+The second row sets both the scope *and* the resource to `Zone`. That looks like
+a duplication in Cloudflare's interface, but it is correct: it is the permission
+that allows the token to list zones, which is how a domain name is resolved to
+the zone ID required before any DNS record can be created.
+
+It is **not** `Zone → DNS → Read`. That grants reading DNS records only, which
+the `Edit` level in the first row already includes, and it does not permit zone
+lookup — so a token built that way fails during setup.
 
 The installer verifies the token by exercising it rather than by querying its
 permissions, because a scoped Cloudflare token cannot introspect itself. It
