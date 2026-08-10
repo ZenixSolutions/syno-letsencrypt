@@ -96,13 +96,24 @@ cf_find_zone() {
         return 1
     fi
 
-    # Longest match wins, so a token that can see both example.com and
-    # sub.example.com picks the more specific zone the record belongs to.
+    # A certificate for files.example.com is issued against the zone
+    # example.com, so an exact match is not enough -- the name has to be
+    # matched as a suffix too.
+    #
+    # The zone object is bound to $z first. Writing this as
+    # `select($d | endswith("." + .name))` looks equivalent but is not: inside
+    # that pipe the input is $d, a string, so `.name` indexes a string and jq
+    # fails with "Cannot index string with string".
+    #
+    # Longest name wins, so an account holding both example.com and
+    # sub.example.com resolves sub.example.com to the more specific zone.
     match="$(printf '%s' "${out}" | jq -r --arg d "${domain}" '
         [ .result[]
-          | select($d == .name or ($d | endswith("." + .name)))
-        ] | sort_by(.name | length) | last // empty
-        | "\(.id) \(.name)"')"
+          | . as $z
+          | select(($d == $z.name) or ($d | endswith("." + $z.name)))
+        ]
+        | sort_by(.name | length)
+        | if length == 0 then empty else .[-1] | "\(.id) \(.name)" end')"
 
     if [ -z "${match}" ]; then
         log_error "No zone in this Cloudflare account matches '${domain}'."
