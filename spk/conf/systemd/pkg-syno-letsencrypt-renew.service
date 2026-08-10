@@ -1,0 +1,13 @@
+[Unit]
+Description=Renew Let's Encrypt certificate via Cloudflare DNS-01
+Documentation=https://github.com/ZenixSolutions/syno-letsencrypt
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/var/packages/syno-letsencrypt/target/bin/syno-letsencrypt renew
+# Renewal touches DSM's certificate store and restarts system services.
+User=root
+# Never let a transient DNS or ACME failure look like success.
+SuccessExitStatus=0

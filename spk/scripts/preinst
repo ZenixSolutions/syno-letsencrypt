@@ -1,0 +1,34 @@
+#!/bin/sh
+# SYNOPKG_* and wizard_* variables are exported into this script's
+# environment by the DSM package framework, not assigned here.
+# shellcheck disable=SC2154
+# Checks only — must not change the system. A non-zero exit aborts the install
+# with the message we print here, which is the friendliest failure point we get.
+set -eu
+
+PKGVAR="/var/packages/${SYNOPKG_PKGNAME}/var"
+
+fail() { echo "$*" >&2; exit 1; }
+
+# DSM 7 or newer. os_min_ver already gates this, but the message is better here.
+[ "${SYNOPKG_DSM_VERSION_MAJOR:-0}" -ge 7 ] \
+    || fail "This package requires DSM 7.0 or later."
+
+# The certificate store must look the way we expect before we accept the token.
+[ -d /usr/syno/etc/certificate/_archive ] \
+    || fail "DSM certificate store not found. This does not look like a supported DSM 7 system."
+
+# Outbound HTTPS is mandatory: we talk to Cloudflare and to Let's Encrypt.
+if command -v curl >/dev/null 2>&1; then
+    curl --silent --show-error --fail --max-time 15 -o /dev/null \
+        https://api.cloudflare.com/client/v4/ \
+        || fail "Cannot reach api.cloudflare.com. Check this NAS's DNS and internet access, then try again."
+fi
+
+[ -n "${wizard_cf_bootstrap_token:-}" ] \
+    || fail "No Cloudflare setup token was provided."
+[ -n "${wizard_domains:-}" ] \
+    || fail "No domains were provided."
+
+mkdir -p "${PKGVAR}"
+exit 0

@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  shellcheck:
+    name: ShellCheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install shellcheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+      - name: Lint bash sources
+        run: shellcheck -x --severity=style src/bin/syno-letsencrypt src/lib/*.sh build/*.sh
+      - name: Lint DSM control scripts
+        # These run under DSM's /bin/sh, so they are checked as POSIX sh.
+        run: shellcheck --shell=sh --severity=style spk/scripts/*
+
+  wizard-json:
+    name: Validate wizard JSON
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Parse every wizard and conf file
+        run: |
+          for f in spk/WIZARD_UIFILES/* spk/conf/privilege spk/conf/resource; do
+            echo "checking $f"
+            jq empty "$f"
+          done
+
+  build:
+    name: Build SPK (${{ matrix.arch }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        arch: [x86_64, armv8, armv7]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: build/build-spk.sh --arch ${{ matrix.arch }} --version 0.0.0-1
+      - name: Verify archive layout
+        # package.tgz must be the first member or DSM rejects the package.
+        run: |
+          spk=$(ls dist/*.spk)
+          first=$(tar tf "$spk" | head -n1)
+          echo "first member: $first"
+          [ "$first" = "package.tgz" ] || { echo "package.tgz must be first"; exit 1; }
+          tar tf "$spk"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: spk-${{ matrix.arch }}
+          path: dist/*

@@ -1,0 +1,10 @@
+#!/bin/sh
+# SYNOPKG_* and wizard_* variables are exported into this script's
+# environment by the DSM package framework, not assigned here.
+# shellcheck disable=SC2154
+set -eu
+if command -v synosystemctl >/dev/null 2>&1; then
+    synosystemctl stop    "pkg-${SYNOPKG_PKGNAME}-renew.timer" || true
+    synosystemctl disable "pkg-${SYNOPKG_PKGNAME}-renew.timer" || true
+fi
+exit 0

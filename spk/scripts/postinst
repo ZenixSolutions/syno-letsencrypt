@@ -1,0 +1,60 @@
+#!/bin/sh
+# SYNOPKG_* and wizard_* variables are exported into this script's
+# environment by the DSM package framework, not assigned here.
+# shellcheck disable=SC2154
+# Runs as root (see conf/privilege). This is where the Cloudflare token is
+# minted and the first certificate is issued.
+#
+# A non-zero exit here marks the package CORRUPTED in Package Center, which is
+# a bad experience for a recoverable problem such as a typo'd domain. So this
+# script separates:
+#   * setup failures  -> non-zero, package is genuinely unusable
+#   * issuance failures -> logged loudly, package installs, user can retry
+set -eu
+
+TARGET="${SYNOPKG_PKGDEST}"
+PKGVAR="/var/packages/${SYNOPKG_PKGNAME}/var"
+PKGHOME="/var/packages/${SYNOPKG_PKGNAME}/home"
+
+mkdir -p "${PKGVAR}" "${PKGHOME}"
+chmod 0700 "${PKGHOME}"
+
+# --- persist wizard answers -------------------------------------------------
+# Wizard variables exist only in this script's environment. Anything needed
+# later (renewals, upgrades) must be written down now.
+CONFIG="${PKGVAR}/config"
+umask 077
+cat > "${CONFIG}" <<CONF
+DOMAINS="${wizard_domains:-}"
+ACME_EMAIL="${wizard_acme_email:-}"
+SET_DEFAULT="${wizard_set_default:-false}"
+STAGING="${wizard_staging:-false}"
+CONF
+chmod 0600 "${CONFIG}"
+
+# --- mint the scoped Cloudflare token ---------------------------------------
+# The bootstrap token is passed by environment and never written to disk.
+if ! CF_BOOTSTRAP_TOKEN="${wizard_cf_bootstrap_token}" \
+     "${TARGET}/bin/syno-letsencrypt" setup; then
+    echo "Cloudflare setup failed. See /var/log/packages/${SYNOPKG_PKGNAME}.log" >&2
+    exit 1
+fi
+
+# --- install and enable the renewal timer -----------------------------------
+# conf/systemd/pkg-* units are copied to /usr/local/lib/systemd/system by the
+# package framework, but are not enabled for us.
+if command -v synosystemctl >/dev/null 2>&1; then
+    synosystemctl enable "pkg-${SYNOPKG_PKGNAME}-renew.timer" || true
+    synosystemctl start  "pkg-${SYNOPKG_PKGNAME}-renew.timer" || true
+fi
+
+# --- first issuance ---------------------------------------------------------
+# Deliberately non-fatal: a wrong domain should not leave a corrupted package.
+if ! "${TARGET}/bin/syno-letsencrypt" issue; then
+    echo "" >&2
+    echo "The package installed, but the first certificate could not be issued." >&2
+    echo "Check /var/log/packages/${SYNOPKG_PKGNAME}.log, then retry with:" >&2
+    echo "    sudo /usr/local/bin/syno-letsencrypt issue" >&2
+fi
+
+exit 0

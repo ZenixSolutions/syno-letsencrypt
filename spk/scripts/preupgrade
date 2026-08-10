@@ -1,0 +1,9 @@
+#!/bin/sh
+# SYNOPKG_* and wizard_* variables are exported into this script's
+# environment by the DSM package framework, not assigned here.
+# shellcheck disable=SC2154
+# Config and certificates live under var/ and home/, which survive an upgrade,
+# so there is nothing to stash here. Kept as an explicit no-op rather than
+# omitted, so the intent is on the record.
+set -eu
+exit 0

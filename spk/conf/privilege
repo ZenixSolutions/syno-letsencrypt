@@ -1,0 +1,12 @@
+{
+    "defaults": { "run-as": "package" },
+    "username": "syno-letsencrypt",
+    "groupname": "syno-letsencrypt",
+    "ctrl-script": [
+        { "action": "postinst",   "run-as": "root" },
+        { "action": "postupgrade", "run-as": "root" },
+        { "action": "postuninst", "run-as": "root" },
+        { "action": "start",      "run-as": "root" },
+        { "action": "stop",       "run-as": "root" }
+    ]
+}

@@ -1,0 +1,76 @@
+[
+  {
+    "step_title": "Cloudflare account",
+    "items": [
+      {
+        "type": "password",
+        "desc": "<p>This package needs to create DNS TXT records in Cloudflare to prove you own your domain.</p><p>Paste a <b>setup token</b> below. Create one at <b>dash.cloudflare.com &rarr; My Profile &rarr; API Tokens &rarr; Create Token &rarr; Custom token</b> with a single permission: <b>User &rarr; API Tokens &rarr; Edit</b>.</p><p>This token is used <b>once</b>, during installation, to create a second token that can only edit DNS for your domain. The setup token is never written to disk. You can delete it in Cloudflare as soon as installation finishes.</p>",
+        "subitems": [
+          {
+            "key": "wizard_cf_bootstrap_token",
+            "desc": "Setup token",
+            "validator": {
+              "allowBlank": false,
+              "minLength": 20,
+              "blankText": "A Cloudflare setup token is required."
+            }
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "step_title": "Certificate",
+    "invalid_next_disabled": true,
+    "items": [
+      {
+        "type": "textfield",
+        "desc": "<p>Which names should the certificate cover? The domain must already be hosted in the Cloudflare account above.</p>",
+        "subitems": [
+          {
+            "key": "wizard_domains",
+            "desc": "Domains",
+            "emptyText": "example.com,*.example.com",
+            "validator": {
+              "allowBlank": false,
+              "regex": {
+                "expr": "/^\\s*\\*?[A-Za-z0-9._-]+\\.[A-Za-z]{2,}\\s*(,\\s*\\*?[A-Za-z0-9._-]+\\.[A-Za-z]{2,}\\s*)*$/",
+                "errorText": "Comma-separated domains, e.g. example.com,*.example.com"
+              }
+            }
+          },
+          {
+            "key": "wizard_acme_email",
+            "desc": "Email for expiry notices",
+            "emptyText": "you@example.com",
+            "validator": {
+              "allowBlank": false,
+              "vtype": "email"
+            }
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "step_title": "Options",
+    "items": [
+      {
+        "type": "multiselect",
+        "desc": "<p>Leave these as they are unless you have a reason not to.</p>",
+        "subitems": [
+          {
+            "key": "wizard_set_default",
+            "desc": "Use this certificate for DSM itself (recommended)",
+            "defaultValue": true
+          },
+          {
+            "key": "wizard_staging",
+            "desc": "Use the Let's Encrypt <b>staging</b> environment. Issues an untrusted test certificate, but has no rate limits. Useful for a first dry run.",
+            "defaultValue": false
+          }
+        ]
+      }
+    ]
+  }
+]

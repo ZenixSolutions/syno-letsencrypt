@@ -1,0 +1,32 @@
+#!/bin/sh
+# SYNOPKG_* and wizard_* variables are exported into this script's
+# environment by the DSM package framework, not assigned here.
+# shellcheck disable=SC2154
+# This package has no daemon: renewal is a systemd timer. start/stop therefore
+# control the timer, and status reports whether it is armed.
+#
+# start-stop-status is still a required script on DSM 7, so it cannot simply be
+# omitted.
+set -eu
+
+TIMER="pkg-${SYNOPKG_PKGNAME}-renew.timer"
+
+case "$1" in
+    start)
+        synosystemctl start "${TIMER}" >/dev/null 2>&1 || true
+        exit 0
+        ;;
+    stop)
+        synosystemctl stop "${TIMER}" >/dev/null 2>&1 || true
+        exit 0
+        ;;
+    status)
+        if systemctl is-active --quiet "${TIMER}" 2>/dev/null; then
+            exit 0      # running
+        fi
+        exit 3          # not running
+        ;;
+    *)
+        exit 4          # unknown
+        ;;
+esac
