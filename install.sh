@@ -56,6 +56,75 @@ fail()  { printf '  %s✗%s %s\n' "${C_RED}" "${C_RESET}" "$*"; }
 rule()  { printf '%s%s%s\n' "${C_DIM}" "──────────────────────────────────────────────────────────────" "${C_RESET}"; }
 die()   { printf '\n%sError:%s %s\n' "${C_RED}${C_BOLD}" "${C_RESET}" "$*" >&2; exit 1; }
 
+# --------------------------------------------------------------------------
+# Animated checks
+# --------------------------------------------------------------------------
+# Each check is near-instant, so a spinner would flash past unread. Holding
+# each one on screen briefly makes the sequence legible — the point is for
+# someone to see what is being verified, not to save 12 seconds.
+
+CHECK_DELAY="${CHECK_DELAY:-3}"          # seconds to show each check
+# An array, not a string sliced with ${x:i:1}: bash substrings count bytes
+# unless the locale is UTF-8, and a NAS shell is often not. Slicing the braille
+# characters by byte emits fragments of multi-byte sequences rather than frames.
+readonly SPIN_FRAMES=( '⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏' )
+SPIN_TICK="0.08"
+
+# DSM ships GNU sleep, but busybox sleep accepts whole seconds only. Probe once
+# rather than assume, and fall back to a slower spin if fractions are refused.
+_detect_sleep() {
+    sleep 0.05 >/dev/null 2>&1 || SPIN_TICK="1"
+}
+
+# run_check <label> <command...>
+#
+# Runs the command with a spinner, then leaves a tick or a cross in place of it.
+# Command output is shown only on failure, so a clean run stays clean.
+run_check() {
+    local label="$1"; shift
+    local outfile rcfile rc pid frames=0 i=0 min_frames
+
+    # No terminal (output redirected to a file, say) — just run it.
+    if [ ! -t 1 ]; then
+        if "$@" >/dev/null 2>&1; then ok "${label}"; return 0; fi
+        fail "${label}"; return 1
+    fi
+
+    outfile="$(mktemp)"; rcfile="$(mktemp)"
+    ( "$@" >"${outfile}" 2>&1; printf '%s' "$?" >"${rcfile}" ) &
+    pid=$!
+
+    if [ "${SPIN_TICK}" = "1" ]; then
+        min_frames="${CHECK_DELAY}"
+    else
+        min_frames=$(( CHECK_DELAY * 12 ))
+    fi
+
+    while kill -0 "${pid}" 2>/dev/null || [ "${frames}" -lt "${min_frames}" ]; do
+        printf '\r  %s%s%s %s' \
+            "${C_BLUE}" "${SPIN_FRAMES[$(( i % ${#SPIN_FRAMES[@]} ))]}" "${C_RESET}" "${label}"
+        i=$(( i + 1 )); frames=$(( frames + 1 ))
+        sleep "${SPIN_TICK}"
+    done
+    wait "${pid}" 2>/dev/null || true
+
+    rc="$(cat "${rcfile}" 2>/dev/null || echo 1)"
+    printf '\r\033[2K'                       # erase the spinner line
+
+    if [ "${rc}" = "0" ]; then
+        ok "${label}"
+        rm -f "${outfile}" "${rcfile}"
+        return 0
+    fi
+
+    fail "${label}"
+    if [ -s "${outfile}" ]; then
+        while IFS= read -r l; do printf '      %s%s%s\n' "${C_DIM}" "${l}" "${C_RESET}"; done < "${outfile}"
+    fi
+    rm -f "${outfile}" "${rcfile}"
+    return 1
+}
+
 banner() {
     local cols
     cols="$(tput cols 2>/dev/null || echo 80)"
@@ -148,33 +217,58 @@ pause_for() {
 # --------------------------------------------------------------------------
 # Pre-flight
 # --------------------------------------------------------------------------
+# Individual checks, each returning 0 or non-zero.
+
+_check_root()      { [ "$(id -u)" -eq 0 ]; }
+_check_tty()       { [ -e "${TTY}" ]; }
+_check_store()     { [ -d /usr/syno/etc/certificate/_archive ]; }
+_check_api()       { [ -x /usr/syno/bin/synowebapi ]; }
+_check_curl()      { command -v curl >/dev/null 2>&1; }
+
+# Reachability, not authorisation.
+#
+# An unauthenticated request to the Cloudflare API root correctly returns
+# HTTP 400 ("Missing Authorization header"), and Let's Encrypt's directory
+# returns 200. `curl --fail` treats any 4xx as an error, which made a perfectly
+# healthy NAS look like it had no internet access. What matters here is whether
+# an HTTP response came back at all: curl reports 000 when it could not connect.
+_check_reachable() {
+    local url="$1" code
+    code="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 15 "${url}" 2>&1)" || code="000"
+    case "${code}" in
+        000|"") printf 'no HTTP response from %s\n' "${url}" >&2; return 1 ;;
+        *)      return 0 ;;
+    esac
+}
+_check_cloudflare()   { _check_reachable https://api.cloudflare.com/client/v4/; }
+_check_letsencrypt()  { _check_reachable https://acme-v02.api.letsencrypt.org/directory; }
+
 preflight() {
     bold "Checking this system"
     rule
+    _detect_sleep
 
-    [ "$(id -u)" -eq 0 ] \
+    run_check "running as root" _check_root \
         || die "This needs root. Re-run with: curl -fsSL https://raw.githubusercontent.com/${REPO}/${REF}/install.sh | sudo bash"
-    ok "running as root"
 
-    [ -e "${TTY}" ] \
-        || die "No terminal available. This installer is interactive — run it from an SSH session."
+    run_check "interactive terminal available" _check_tty \
+        || die "This installer is interactive. Run it from an SSH session."
 
-    [ -d /usr/syno/etc/certificate/_archive ] \
+    run_check "DSM certificate store found" _check_store \
         || die "This does not look like a Synology NAS running DSM 7."
-    ok "DSM certificate store found"
 
-    [ -x /usr/syno/bin/synowebapi ] \
+    run_check "DSM certificate API available" _check_api \
         || die "/usr/syno/bin/synowebapi is missing. DSM 7.0 or later is required."
-    ok "DSM certificate API available"
 
-    command -v curl >/dev/null 2>&1 || die "curl is required but not installed."
+    run_check "curl available" _check_curl \
+        || die "curl is required but not installed."
 
-    if curl --silent --show-error --fail --max-time 15 -o /dev/null \
-            https://api.cloudflare.com/client/v4/; then
-        ok "can reach Cloudflare"
-    else
-        die "Cannot reach api.cloudflare.com. Check this NAS's DNS and internet access."
-    fi
+    run_check "Cloudflare reachable" _check_cloudflare \
+        || die "Cannot reach api.cloudflare.com. Check this NAS's DNS and internet access."
+
+    run_check "Let's Encrypt reachable" _check_letsencrypt \
+        || die "Cannot reach acme-v02.api.letsencrypt.org. Check this NAS's DNS and internet access."
+
     say ""
 }
 
