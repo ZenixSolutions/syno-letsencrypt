@@ -25,7 +25,6 @@ readonly BIN_DIR="/usr/local/bin"
 readonly LIB_DIR="/usr/local/share/syno-letsencrypt/lib"
 readonly CONFIG_DIR="/usr/local/etc/syno-letsencrypt"
 readonly CONFIG="${CONFIG_DIR}/config"
-readonly SYSTEMD_DIR="/etc/systemd/system"
 
 # When piped from curl, stdin is the script itself — every prompt has to read
 # from the terminal explicitly or it silently reads script text and races off.
@@ -58,8 +57,29 @@ rule()  { printf '%s%s%s\n' "${C_DIM}" "─────────────�
 die()   { printf '\n%sError:%s %s\n' "${C_RED}${C_BOLD}" "${C_RESET}" "$*" >&2; exit 1; }
 
 banner() {
+    local cols
+    cols="$(tput cols 2>/dev/null || echo 80)"
+
     printf '%s' "${C_BLUE}"
-    cat <<'ART'
+    # The full wordmark is 100 columns. On anything narrower it wraps into
+    # noise, so fall back to something that still reads as a logo.
+    if [ "${cols}" -ge 104 ]; then
+        cat <<'ART'
+=====================
+===================   **    *************  ************#    ***        ***    ***#   #***       #**#
+====      =======   ****   #*************  *************    *****     ****#   ****   #*****    *****
+====    =======   ******    #***********   *****#######*    ******    ****#   ****     ***** #****#
+====  =======   *******          #****     *****            ********  ****#   ****      *********
+==   ======   *******           *****      *************    ****#**** ****#   ****        ******
+   ======   *******   **       ****        *************    ****  ********#   ****       ********
+ ======   *******   ****     *****         *****            ****    ******#   ****     ***********
+=====   *******    *****    *************  *************    ****     *****#   ****    *****   *****
+===   *******      *****   **************  *************    ****      ****    ****   ****#      ****
+=   ********************
+  **********************
+ART
+    else
+        cat <<'ART'
 
    ███████╗███████╗███╗   ██╗██╗██╗  ██╗
    ╚══███╔╝██╔════╝████╗  ██║██║╚██╗██╔╝
@@ -68,8 +88,8 @@ banner() {
    ███████╗███████╗██║ ╚████║██║██╔╝ ██╗
    ╚══════╝╚══════╝╚═╝  ╚═══╝╚═╝╚═╝  ╚═╝
 ART
-    printf '%s' "${C_RESET}"
-    printf '   %sS O L U T I O N S%s\n\n' "${C_DIM}" "${C_RESET}"
+    fi
+    printf '%s\n' "${C_RESET}"
     bold "   Let's Encrypt for Synology DSM"
     dim  "   Wildcard certificates over Cloudflare DNS-01. No open ports."
     say ""
@@ -170,6 +190,7 @@ readonly SOURCE_FILES=(
     "src/lib/log.sh"
     "src/lib/cloudflare.sh"
     "src/lib/dsm.sh"
+    "src/lib/schedule.sh"
     "src/bin/syno-letsencrypt"
 )
 
@@ -288,6 +309,148 @@ TXT
 }
 
 # --------------------------------------------------------------------------
+# Which certificate, and which services
+# --------------------------------------------------------------------------
+
+# choose_certificate — sets CERT_MODE (replace|new) and CERT_REPLACE_ID.
+#
+# Replacing is the better default and not merely for tidiness: DSM preserves a
+# certificate's entire service list when it is replaced in place, whereas a new
+# entry starts with nothing attached. `as_default` does NOT migrate the other
+# services — they stay on the old certificate — so a "new" certificate that
+# looks right in Control Panel can leave FTPS, VPN and Drive still serving the
+# old one.
+choose_certificate() {
+    bold "Certificate in DSM"
+    rule
+
+    local summary n=0
+    local -a ids=() labels=()
+    summary="$(dsm_cert_summary 2>/dev/null || true)"
+
+    if [ -z "${summary}" ]; then
+        warn "Could not read the existing certificates; a new one will be created."
+        CERT_MODE="new"; CERT_REPLACE_ID=""
+        say ""
+        return
+    fi
+
+    say "This NAS currently has:"
+    say ""
+    while IFS=$'\t' read -r id desc cn isdef nsvc; do
+        [ -n "${id}" ] || continue
+        n=$((n + 1))
+        ids+=("${id}")
+        labels+=("${cn:-${desc:-${id}}}")
+        printf '   %s%2d%s  %-38s %s%s, %s service(s)%s\n' \
+            "${C_BOLD}" "${n}" "${C_RESET}" \
+            "${cn:-${desc:-untitled}}" \
+            "${C_DIM}" "${isdef:-not default}" "${nsvc}" "${C_RESET}"
+    done <<< "${summary}"
+    say ""
+
+    dim "Replacing keeps every service the old certificate served."
+    dim "Creating a new one starts with nothing attached, and you choose below."
+    say ""
+
+    local reply=""
+    printf 'Replace one of these, or create a new certificate? %s[1-%d / new]%s: ' \
+        "${C_DIM}" "${n}" "${C_RESET}" > "${TTY}"
+    IFS= read -r reply < "${TTY}" || true
+    reply="${reply:-1}"
+
+    case "${reply}" in
+        [Nn]*|"new")
+            CERT_MODE="new"; CERT_REPLACE_ID=""
+            ok "will create a new certificate"
+            ;;
+        *)
+            if [ "${reply}" -ge 1 ] 2>/dev/null && [ "${reply}" -le "${n}" ]; then
+                CERT_MODE="replace"
+                CERT_REPLACE_ID="${ids[$((reply - 1))]}"
+                ok "will replace: ${labels[$((reply - 1))]} (${CERT_REPLACE_ID})"
+            else
+                CERT_MODE="new"; CERT_REPLACE_ID=""
+                warn "not a listed number — creating a new certificate instead"
+            fi
+            ;;
+    esac
+    say ""
+}
+
+# choose_services — writes the chosen service objects to services.json.
+#
+# The objects are stored verbatim as DSM reported them. Reassignment requires
+# handing the same object back unchanged; the i18n keys and owner values differ
+# per service and per DSM release, and inventing them is what produces the
+# error 5503 people hit with this API.
+choose_services() {
+    bold "Which services should use this certificate?"
+    rule
+
+    local svcs count
+    svcs="$(dsm_services_with_owner 2>/dev/null || printf '[]')"
+    count="$(printf '%s' "${svcs}" | jq 'length' 2>/dev/null || echo 0)"
+
+    if [ "${count}" -eq 0 ]; then
+        warn "Could not read the service list; leaving assignments untouched."
+        printf '[]' > "${CONFIG_DIR}/services.json"
+        say ""
+        return
+    fi
+
+    # Pre-select whatever the certificate being replaced already serves, so
+    # pressing Enter is genuinely a no-op.
+    local preselect="${CERT_REPLACE_ID:-}"
+    local i=1
+    local -a keys=() preset=()
+
+    while IFS=$'\t' read -r name sub svc old; do
+        keys+=("${sub}/${svc}")
+        local mark="   "
+        if [ -n "${preselect}" ] && [ "${old}" = "${preselect}" ]; then
+            mark="${C_GREEN}[x]${C_RESET}"; preset+=("${i}")
+        fi
+        printf '   %s%2d%s %b %-38s %s%s%s\n' \
+            "${C_BOLD}" "${i}" "${C_RESET}" "${mark}" "${name}" \
+            "${C_DIM}" "$([ -n "${old}" ] && echo "currently: ${old}" || echo "unassigned")" "${C_RESET}"
+        i=$((i + 1))
+    done < <(printf '%s' "${svcs}" | jq -r '.[] | [ (.display_name // (.subscriber + "/" + .service)), .subscriber, .service, ._old_id ] | @tsv')
+
+    say ""
+    dim "Enter numbers separated by commas, or 'all', or 'none'."
+    [ ${#preset[@]} -gt 0 ] && dim "Press Enter to keep the ones marked [x]."
+    say ""
+
+    local reply=""
+    printf 'Services %s[%s]%s: ' "${C_DIM}" \
+        "$([ ${#preset[@]} -gt 0 ] && (IFS=,; echo "${preset[*]}") || echo "all")" "${C_RESET}" > "${TTY}"
+    IFS= read -r reply < "${TTY}" || true
+
+    if [ -z "${reply}" ]; then
+        if [ ${#preset[@]} -gt 0 ]; then reply="$(IFS=,; echo "${preset[*]}")"; else reply="all"; fi
+    fi
+
+    local selected
+    case "${reply}" in
+        all|ALL|a)   selected="$(printf '%s' "${svcs}")" ;;
+        none|NONE|n) selected='[]' ;;
+        *)
+            # Turn "1,3, 5" into a JSON array of zero-based indices.
+            local idx
+            idx="$(printf '%s' "${reply}" | tr ',' '\n' | tr -d ' ' \
+                   | grep -E '^[0-9]+$' | awk '{ print $1 - 1 }' | jq -Rs 'split("\n") | map(select(length>0) | tonumber)')"
+            selected="$(printf '%s' "${svcs}" | jq -c --argjson idx "${idx}" '[ . as $s | $idx[] | $s[.] | select(. != null) ]')"
+            ;;
+    esac
+
+    printf '%s' "${selected}" > "${CONFIG_DIR}/services.json"
+    chmod 0600 "${CONFIG_DIR}/services.json"
+    ok "$(printf '%s' "${selected}" | jq 'length') service(s) selected"
+    say ""
+}
+
+# --------------------------------------------------------------------------
 # Install
 # --------------------------------------------------------------------------
 install_files() {
@@ -325,46 +488,37 @@ RENEW_DAYS="30"
 # networks running Pi-hole, AdGuard or split-horizon DNS. Used for the
 # challenge lookup only.
 DNS_RESOLVERS="1.1.1.1:53 8.8.8.8:53"
+
+# How DSM labels this certificate in Control Panel. Renewals match on it.
+CERT_DESC="${CERT_DESC_IN}"
+
+# replace = update an existing DSM certificate in place, keeping its services.
+# new     = create a separate entry; services come from services.json.
+CERT_MODE="${CERT_MODE}"
+CERT_REPLACE_ID="${CERT_REPLACE_ID}"
 CONF
     install -m 600 -o root -g root "${tmp}" "${CONFIG}"
     rm -f "${tmp}"
     ok "wrote ${CONFIG} (root only)"
 }
 
-install_timer() {
-    # A systemd timer rather than cron: DSM rewrites /etc/crontab and is fussy
-    # about its exact formatting, whereas DSM 7 is systemd-based. Persistent
-    # catches up a run missed while the NAS was off, and the randomised delay
-    # keeps every NAS on earth from hitting Let's Encrypt at the same minute.
-    cat > "${SYSTEMD_DIR}/syno-letsencrypt.service" <<'UNIT'
-[Unit]
-Description=Renew Let's Encrypt certificate via Cloudflare DNS-01
-After=network-online.target
-Wants=network-online.target
+# Earlier versions of this installer scheduled renewal with a systemd timer.
+# Leaving it in place alongside the new DSM task would renew twice a day.
+remove_legacy_timer() {
+    [ -f /etc/systemd/system/syno-letsencrypt.timer ] || return 0
+    systemctl disable --now syno-letsencrypt.timer >/dev/null 2>&1 || true
+    rm -f /etc/systemd/system/syno-letsencrypt.timer \
+          /etc/systemd/system/syno-letsencrypt.service
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    ok "removed the systemd timer from a previous install"
+}
 
-[Service]
-Type=oneshot
-ExecStart=/usr/local/bin/syno-letsencrypt renew
-UNIT
-
-    cat > "${SYSTEMD_DIR}/syno-letsencrypt.timer" <<'UNIT'
-[Unit]
-Description=Daily Let's Encrypt renewal check
-
-[Timer]
-OnCalendar=daily
-RandomizedDelaySec=6h
-Persistent=true
-
-[Install]
-WantedBy=timers.target
-UNIT
-
-    chmod 644 "${SYSTEMD_DIR}/syno-letsencrypt".{service,timer}
-    systemctl daemon-reload
-    systemctl enable --now syno-letsencrypt.timer >/dev/null 2>&1 \
-        || warn "Could not enable the timer; run: systemctl enable --now syno-letsencrypt.timer"
-    ok "scheduled a daily renewal check"
+install_schedule() {
+    remove_legacy_timer
+    # sched_install creates a root-owned daily task through synowebapi, since
+    # synoschedtask has no --add. It prints the manual click-path and returns
+    # non-zero if DSM refuses, rather than leaving renewal silently unscheduled.
+    sched_install "${EMAIL_IN}" || true
 }
 
 # --------------------------------------------------------------------------
@@ -377,6 +531,10 @@ main() {
     . "${SRC_DIR}/src/lib/log.sh"
     # shellcheck source=src/lib/cloudflare.sh
     . "${SRC_DIR}/src/lib/cloudflare.sh"
+    # shellcheck source=src/lib/dsm.sh
+    . "${SRC_DIR}/src/lib/dsm.sh"
+    # shellcheck source=src/lib/schedule.sh
+    . "${SRC_DIR}/src/lib/schedule.sh"
 
     install_dependencies
 
@@ -423,11 +581,18 @@ main() {
     ok "token verified against ${first}"
     say ""
 
+    # Needs the tools in place first: the pickers read DSM state through jq.
+    install_files
+
+    local CERT_MODE="replace" CERT_REPLACE_ID="" CERT_DESC_IN=""
+    CERT_DESC_IN="Let's Encrypt (${first})"
+    choose_certificate
+    choose_services
+
     bold "Installing"
     rule
-    install_files
     write_config
-    install_timer
+    install_schedule
     say ""
 
     rule
@@ -462,7 +627,9 @@ main() {
     say ""
     dim "  sudo syno-letsencrypt status    expiry and next scheduled run"
     dim "  sudo syno-letsencrypt check     re-validate the token, change nothing"
-    dim "  sudo syno-letsencrypt renew     what the daily timer runs"
+    dim "  sudo syno-letsencrypt renew     what the scheduled task runs"
+    say ""
+    dim "  Renewal is visible in Control Panel > Task Scheduler."
     say ""
 }
 

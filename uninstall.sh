@@ -15,11 +15,29 @@ set -euo pipefail
 PURGE=false
 [ "${1:-}" = "--purge" ] && PURGE=true
 
-echo "Stopping the renewal timer..."
-systemctl disable --now syno-letsencrypt.timer 2>/dev/null || true
-rm -f /etc/systemd/system/syno-letsencrypt.timer \
-      /etc/systemd/system/syno-letsencrypt.service
-systemctl daemon-reload 2>/dev/null || true
+LIB_DIR="/usr/local/share/syno-letsencrypt/lib"
+if [ -r "${LIB_DIR}/log.sh" ]; then
+    # shellcheck source=src/lib/log.sh
+    . "${LIB_DIR}/log.sh"
+    # shellcheck source=src/lib/dsm.sh
+    . "${LIB_DIR}/dsm.sh"
+    # shellcheck source=src/lib/schedule.sh
+    . "${LIB_DIR}/schedule.sh"
+    echo "Removing the scheduled task..."
+    sched_remove || true
+else
+    echo "Program files already gone; remove the task in Control Panel > Task Scheduler."
+fi
+
+# Clean up the systemd units earlier versions installed, so upgrading from one
+# of those does not leave a second renewal running alongside the DSM task.
+if [ -f /etc/systemd/system/syno-letsencrypt.timer ]; then
+    echo "Removing the systemd timer left by an earlier version..."
+    systemctl disable --now syno-letsencrypt.timer 2>/dev/null || true
+    rm -f /etc/systemd/system/syno-letsencrypt.timer \
+          /etc/systemd/system/syno-letsencrypt.service
+    systemctl daemon-reload 2>/dev/null || true
+fi
 
 echo "Removing program files..."
 rm -f  /usr/local/bin/syno-letsencrypt

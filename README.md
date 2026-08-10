@@ -27,8 +27,9 @@ curl -fsSL https://raw.githubusercontent.com/ZenixSolutions/syno-letsencrypt/mai
 ```
 
 It checks your NAS, downloads `lego`, asks for your Cloudflare token and
-domains, **proves the token works before writing anything**, and schedules a
-daily renewal check.
+domains, **proves the token works before writing anything**, lets you choose
+whether to replace an existing DSM certificate or create a new one and which
+services should use it, then schedules a daily renewal check.
 
 Prefer to read it first? That's the better instinct:
 
@@ -64,14 +65,14 @@ Renewal is automatic. Everything is also available on demand:
 ```sh
 sudo syno-letsencrypt status    # expiry and next scheduled run
 sudo syno-letsencrypt check     # re-validate the token, change nothing
-sudo syno-letsencrypt renew     # what the daily timer runs
+sudo syno-letsencrypt renew     # what the scheduled task runs
 sudo syno-letsencrypt issue     # force a fresh issuance
 ```
 
 Configuration lives in `/usr/local/etc/syno-letsencrypt/config` (root-only) and
 is plain shell — edit it directly and re-run `check`.
 
-Renewal logs: `journalctl -u syno-letsencrypt`.
+Renewal runs and their exit status appear in Control Panel → Task Scheduler.
 
 ## How it works
 
@@ -81,8 +82,10 @@ Renewal logs: `journalctl -u syno-letsencrypt`.
    Control Panel uses when you upload one by hand — so DSM writes its own
    certificate store, copies the certificate to every subscribing service, and
    reloads its web server itself.
-3. A systemd timer checks daily and renews inside 30 days, re-importing only
-   when the certificate actually changed.
+3. A **DSM Task Scheduler** entry checks daily and renews inside 30 days,
+   re-importing only when the certificate actually changed. It shows up in
+   Control Panel → Task Scheduler like any other task, so you can see its last
+   run, disable it, or run it on demand without knowing this tool exists.
 
 Running as root means **no DSM username or password is needed**. The only
 credential stored is the Cloudflare token, at mode `0600`.

@@ -9,7 +9,7 @@
 #   renew    Renew if within the window; install only if it actually changed.
 #   status   Show configuration, expiry, and when the next run is due.
 #
-# Runs as root. Installed by install.sh; the systemd timer calls `renew`.
+# Runs as root. Installed by install.sh; the DSM scheduled task calls `renew`.
 #
 set -euo pipefail
 
@@ -23,6 +23,8 @@ readonly LIB_DIR="${SYNOLE_LIB_DIR:-${SELF_DIR}/../share/syno-letsencrypt/lib}"
 . "${LIB_DIR}/cloudflare.sh"
 # shellcheck source=../lib/dsm.sh
 . "${LIB_DIR}/dsm.sh"
+# shellcheck source=../lib/schedule.sh
+. "${LIB_DIR}/schedule.sh"
 
 readonly CONFIG_DIR="${SYNOLE_CONFIG_DIR:-/usr/local/etc/syno-letsencrypt}"
 readonly CONFIG="${CONFIG_DIR}/config"
@@ -43,6 +45,9 @@ DNS_RESOLVERS="1.1.1.1:53 8.8.8.8:53"
 # they replace the existing entry rather than adding a new one every 60 days.
 DEFAULT_CERT_DESC="Let's Encrypt (syno-letsencrypt)"
 CERT_DESC="${DEFAULT_CERT_DESC}"
+CERT_MODE="replace"
+CERT_REPLACE_ID=""
+readonly SERVICES_FILE="${CONFIG_DIR}/services.json"
 
 load_config() {
     [ -r "${CONFIG}" ] || die "Not configured. Run the installer first: sudo ./install.sh"
@@ -141,7 +146,7 @@ cert_paths() {
 }
 
 install_into_dsm() {
-    local cert key chain leaf
+    local cert key chain leaf target new_id
     read -r cert key chain <<<"$(cert_paths)"
     [ -f "${cert}" ] || die "No certificate at ${cert}"
 
@@ -152,7 +157,26 @@ install_into_dsm() {
     trap "rm -f '${leaf}'" EXIT
     openssl x509 -in "${cert}" -out "${leaf}"
 
-    dsm_import_cert "${leaf}" "${key}" "${chain}" "${CERT_DESC}" "${SET_DEFAULT}"
+    # Decide what we are updating. Order matters:
+    #   1. a certificate we previously created, found by description — this is
+    #      the renewal path, and replacing keeps every service assignment;
+    #   2. the certificate the user chose to replace at install time;
+    #   3. nothing, meaning create a new entry.
+    target="$(dsm_find_cert_id "${CERT_DESC}")"
+    if [ -z "${target}" ] && [ "${CERT_MODE}" = "replace" ]; then
+        target="${CERT_REPLACE_ID}"
+    fi
+
+    new_id="$(dsm_import_cert "${leaf}" "${key}" "${chain}" \
+                "${CERT_DESC}" "${SET_DEFAULT}" "${target}")"
+
+    # Replacing preserves services automatically. A new entry does not, and
+    # as_default only moves the system default -- FTPS, Drive, VPN and friends
+    # stay on the old certificate until explicitly reassigned.
+    if [ -z "${target}" ] && [ -s "${SERVICES_FILE}" ] && [ -n "${new_id}" ]; then
+        dsm_assign_services "${new_id}" "$(cat "${SERVICES_FILE}")" || true
+    fi
+
     date -u '+%Y-%m-%dT%H:%M:%SZ' > "${STATE}"
 }
 
@@ -220,10 +244,15 @@ cmd_status() {
 
     [ -f "${STATE}" ] && printf 'Last install: %s\n' "$(cat "${STATE}")"
 
-    if command -v systemctl >/dev/null 2>&1; then
-        printf 'Next run:     %s\n' \
-            "$(systemctl list-timers --no-pager syno-letsencrypt.timer 2>/dev/null \
-               | awk 'NR==2 {print $1, $2, $3, $4}')"
+    sched_status || true
+
+    local target
+    target="$(dsm_find_cert_id "${CERT_DESC}")"
+    if [ -n "${target}" ]; then
+        printf 'In DSM:       %s serving %s service(s)\n' \
+            "${target}" "$(dsm_cert_services "${target}" | jq 'length')"
+    else
+        printf 'In DSM:       not found under "%s"\n' "${CERT_DESC}"
     fi
     return 0
 }

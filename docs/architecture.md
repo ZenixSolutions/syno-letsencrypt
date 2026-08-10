@@ -92,13 +92,30 @@ This all happens **before** anything is written to disk. A token that can't do
 the job fails during setup, with the specific missing permission named, rather
 than at 3am sixty days later.
 
-## Why a systemd timer, not cron
+## Why DSM Task Scheduler, not cron or a systemd timer
 
-DSM rewrites `/etc/crontab` and is strict about its formatting, so cron entries
-there are fragile. DSM 7 is systemd-based; a timer survives reboots cleanly,
-`Persistent=true` catches up a run missed while the NAS was powered off, and
-`RandomizedDelaySec=6h` avoids every NAS on earth hitting Let's Encrypt in the
-same minute.
+Cron is out: DSM rewrites `/etc/crontab` and is strict about its formatting, so
+entries there quietly stop existing after an update.
+
+A systemd timer works and was the first implementation. It was replaced because
+it is invisible: nothing in DSM's UI shows it, so the answer to "what runs on
+this NAS?" would not include the thing renewing its certificate.
+
+Task Scheduler is where a Synology administrator looks. The entry shows its last
+run and exit status, and can be disabled or run on demand by someone who has
+never heard of this tool.
+
+The trade is real and worth stating. Task Scheduler has no equivalent of
+`RandomizedDelaySec`, so the hour is randomised between 01:00 and 05:00 at
+install time instead; and no equivalent of `Persistent=true`, so a run missed
+while the NAS was powered off is skipped rather than caught up. With a 30-day
+renewal window and a daily check, neither matters.
+
+`synoschedtask` has `--get`, `--del`, `--run` and `--sync`, but no `--add`, so
+the task is created through `synowebapi` — the same mechanism as the
+certificate import. Verified on DSM 7.3: `SYNO.Core.TaskScheduler.Root`
+`method=create version=4` works from a local root shell with no
+password-confirmation token.
 
 ## Layout
 
@@ -108,7 +125,8 @@ uninstall.sh               removal, with --purge
 src/bin/syno-letsencrypt   check, issue, renew, status
 src/lib/log.sh             logging, secret redaction
 src/lib/cloudflare.sh      token validation, zone discovery
-src/lib/dsm.sh             certificate import via synowebapi
+src/lib/dsm.sh             certificate import and service assignment
+src/lib/schedule.sh        the DSM Task Scheduler entry
 ```
 
 Installed to:
@@ -120,7 +138,7 @@ Installed to:
 | `/usr/local/share/syno-letsencrypt/lib/` | 0644 | libraries |
 | `/usr/local/etc/syno-letsencrypt/` | 0700 | config and lego data |
 | `/usr/local/etc/syno-letsencrypt/config` | 0600 | includes the Cloudflare token |
-| `/etc/systemd/system/syno-letsencrypt.{service,timer}` | 0644 | schedule |
+| `/usr/local/etc/syno-letsencrypt/services.json` | 0600 | which services to assign |
 
 The ACME account key lives in `/usr/local/etc/syno-letsencrypt/lego/accounts/`.
 Losing it forces re-registration with Let's Encrypt, so `uninstall.sh` keeps it
