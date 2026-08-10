@@ -19,63 +19,88 @@
 Cloudflare DNS-01 challenge, installed straight into DSM and renewed
 automatically.**
 
-No inbound ports. No DSM password stored anywhere. One command.
+No inbound ports need to be opened, and no DSM credentials are stored.
 
-> **Status: in development.** The DSM APIs it depends on have been verified on
-> real hardware (DSM 7.3), but it has not yet issued a production certificate
-> end to end. Start with staging — the installer defaults to it.
+> **Status: in development.** The DSM interfaces this depends on have been
+> verified on hardware running DSM 7.3, but a production certificate has not yet
+> been issued end to end. The installer defaults to the Let's Encrypt staging
+> environment; begin there.
 
 ---
 
 ## Install
 
-SSH into your NAS and run:
+### Quick install
+
+SSH into the NAS and run:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/ZenixSolutions/syno-letsencrypt/main/install.sh | sudo bash
 ```
 
-Prefer to read it before running it as root? That's the better instinct:
+The installer checks that the system is supported, downloads its dependencies,
+collects the settings it needs, validates them against Cloudflare before writing
+anything, and schedules automatic renewal. Each step is described below.
+
+### Manual install
+
+To review the source before executing it, or to install from a local copy:
 
 ```sh
 git clone https://github.com/ZenixSolutions/syno-letsencrypt.git
 cd syno-letsencrypt
-less install.sh
 sudo ./install.sh
 ```
 
-Re-running the installer is safe. Previous answers become the defaults, and an
-existing certificate is left alone.
+Both methods run the same script and produce the same result.
+
+Re-running the installer at any time is safe. Previous answers are offered as
+defaults, and an existing certificate is left in place.
 
 ---
 
 ## What the installer asks
 
-**1. Your Cloudflare API token.** See [below](#the-cloudflare-token) — there is
-one non-obvious step. The token is checked against Cloudflare *before* anything
-is written to disk.
+**1. Cloudflare API token.** See [below](#the-cloudflare-token); one permission
+is easily missed. The token is validated against Cloudflare before anything is
+written to disk.
 
-**2. Domains and email.** Comma separated. A wildcard does not cover the apex,
-so list both:
+**2. Domains and contact email.** Comma separated. A wildcard does not cover the
+apex domain, so both are normally required:
 
 ```
 example.com,*.example.com
 ```
 
-**3. Staging or production.** Staging issues an untrusted test certificate with
-no rate limits. Production allows only **five duplicate certificates per week**,
-so a mistake found after burning them means waiting. The default is staging.
+**3. Staging or production.** Staging issues an untrusted test certificate and
+is not rate limited. Production permits only **five duplicate certificates per
+week**, so a misconfiguration discovered afterwards can mean waiting several
+days. Staging is the default.
 
-**4. Replace an existing DSM certificate, or create a new one.** It lists what
-your NAS currently has and how many services each certificate serves. This
-choice matters more than it looks — see [below](#replace-or-create-new).
+**4. Replace an existing DSM certificate, or create a new one.** The installer
+lists the certificates already present and how many services each one serves.
+This choice has consequences — see [below](#replace-or-create-new).
 
 **5. Which services should use it.** DSM Desktop, FTPS, VPN Server, Synology
-Drive, KMIP, and anything else installed. When replacing, whatever the old
-certificate already served is pre-selected, so pressing Enter changes nothing.
+Drive, KMIP, and any other installed service. When replacing a certificate, the
+services it already serves are pre-selected.
 
-Then it installs `lego`, writes its configuration, creates the scheduled task,
-and offers to issue the certificate immediately.
+The installer then writes its configuration, creates the scheduled task, and
+offers to issue the certificate immediately.
+
+### Dependencies
+
+Two programs are downloaded during installation:
+
+- **[lego](https://go-acme.github.io/lego/)** — an open-source ACME client, the
+  protocol Let's Encrypt uses to issue certificates. It handles the exchange
+  with Let's Encrypt and creates the Cloudflare DNS records that prove domain
+  ownership. It serves the same purpose as Certbot, but ships as a single
+  static binary with built-in Cloudflare support, which suits a NAS.
+- **jq** — a JSON processor, used to read DSM's API responses. Installed only
+  if DSM does not already provide it.
+
+Both are official release binaries, installed to `/usr/local/bin`.
 
 ---
 
@@ -87,20 +112,20 @@ At [dash.cloudflare.com → My Profile → API Tokens](https://dash.cloudflare.c
 | Scope | Resource | Permission | |
 |---|---|---|---|
 | Zone | DNS | Edit | included by the template |
-| Zone | Zone | **Read** | **you must add this row yourself** |
+| Zone | Zone | **Read** | **must be added manually** |
 
-Under **Zone Resources**, include your domain.
+Under **Zone Resources**, include the domain the certificate is for.
 
-That second row is the one nearly everyone misses. Cloudflare's own template
-doesn't include `Zone → Read`, and without it the certificate cannot be
-issued — your domain has to be resolved to a zone ID before the challenge
+The second row is a common omission. Cloudflare's "Edit zone DNS" template
+grants only `Zone → DNS → Edit`; without `Zone → Read` the certificate cannot be
+issued, because the domain must be resolved to a zone ID before the challenge
 record can be created.
 
-The installer verifies this by *doing* it, not by asking Cloudflare what the
-token can do — a scoped token cannot introspect its own permissions. It lists
-your zones, then creates and immediately deletes a TXT record at
-`_syno-letsencrypt-check.<zone>`. If either fails you are told exactly which
-permission is missing, during setup rather than sixty days later.
+The installer verifies the token by exercising it rather than by querying its
+permissions, because a scoped Cloudflare token cannot introspect itself. It
+lists the account's zones, then creates and immediately deletes a TXT record at
+`_syno-letsencrypt-check.<zone>`. If either operation fails, the missing
+permission is reported during setup rather than at the first renewal.
 
 The token is stored at `/usr/local/etc/syno-letsencrypt/config`, mode `0600`,
 readable only by root.
@@ -109,23 +134,24 @@ readable only by root.
 
 ## Replace or create new?
 
-**Replace is the default, and it is usually right.**
+**Replacing an existing certificate is the default and is recommended.**
 
-When DSM replaces a certificate in place, every service already pointing at it
-keeps working. Nothing else has to happen.
+When DSM replaces a certificate in place, every service already assigned to it
+continues to use it. No further action is required.
 
-Creating a *new* certificate is different, and the difference is easy to miss:
-**`as_default` only moves the System default.** Every other service — FTPS, VPN
-Server, Synology Drive, KMIP, Replication Service — stays on the old
-certificate. Control Panel will show your shiny new certificate looking
-correct while half your services quietly serve the old one.
+Creating a new certificate behaves differently, and the difference is easy to
+overlook. Marking a new certificate as the default moves only the **System
+default** service. Every other service — FTPS, VPN Server, Synology Drive, KMIP,
+Replication Service — remains assigned to the previous certificate. Control
+Panel will show the new certificate as the default while those services continue
+to serve the old one.
 
-So when you choose "new", the installer asks which services should move and
-reassigns them explicitly. Each service is handed back to DSM exactly as DSM
-described it; the internal labels differ per service and per DSM release, and
-inventing them is what produces the `5503` errors people hit with this API.
+When "new" is selected, the installer therefore asks which services should be
+moved and reassigns them explicitly. Each service definition is passed back to
+DSM exactly as DSM reported it, since the internal identifiers vary by service
+and by DSM release.
 
-Renewals always replace in place, whichever you chose at install.
+Renewals always replace in place, regardless of the choice made at install.
 
 ---
 
@@ -140,8 +166,9 @@ sudo syno-letsencrypt renew     # what the scheduled task runs
 sudo syno-letsencrypt issue     # force a fresh issuance
 ```
 
-Configuration is plain shell at `/usr/local/etc/syno-letsencrypt/config` — edit
-it directly and re-run `check`.
+Configuration is stored as plain shell at
+`/usr/local/etc/syno-letsencrypt/config`. It can be edited directly, followed by
+`syno-letsencrypt check` to revalidate.
 
 ---
 
@@ -151,10 +178,9 @@ The installer creates a **DSM Task Scheduler** entry named
 *"Let's Encrypt renewal (syno-letsencrypt)"*, running as root, daily, at a
 randomised hour between 01:00 and 05:00.
 
-It appears in **Control Panel → Task Scheduler** like any other task. You can
-see its last run and exit status, disable it, or run it on demand — without
-knowing this tool exists. That was the point of using it rather than a systemd
-timer, which works but is invisible to anyone looking at the NAS.
+It appears in **Control Panel → Task Scheduler** alongside any other scheduled
+task, where its last run time and exit status are visible and it can be
+disabled or run on demand.
 
 A renewal only re-imports into DSM when the certificate actually changed, so
 DSM's web server is not restarted daily for nothing.
@@ -163,16 +189,17 @@ DSM's web server is not restarted daily for nothing.
 
 ## How it works
 
-1. `lego` proves you own the domain by creating an `_acme-challenge` TXT record
-   in Cloudflare, then removing it. Nothing inbound is ever opened.
-2. The certificate is handed to DSM through `synowebapi` — the same code path
-   Control Panel uses when you upload one by hand — so DSM writes its own
-   certificate store, copies the certificate to every subscribing service, and
-   reloads its web server itself.
+1. `lego` proves domain ownership by creating an `_acme-challenge` TXT record in
+   Cloudflare and removing it once validation completes. No inbound port is
+   opened at any point.
+2. The certificate is passed to DSM through `synowebapi`, the same interface
+   Control Panel uses when a certificate is uploaded manually. DSM writes its
+   own certificate store, copies the certificate to every subscribing service,
+   and reloads its web server.
 3. The scheduled task checks daily and renews within 30 days of expiry.
 
-Because it runs as root, **no DSM username or password is needed anywhere.**
-The only credential stored is the Cloudflare token.
+Because it runs as root, **no DSM username or password is required.** The only
+credential stored on the NAS is the Cloudflare API token.
 
 DSM 7.3 serves dual ECC and RSA certificates — `system/default` contains
 `ECC-cert.pem` and `RSA-cert.pem`, and the `cert.pem` filename every
@@ -200,27 +227,28 @@ releases.
 ## Troubleshooting
 
 **"The token could not list zones"** — the token is missing `Zone → Zone →
-Read`. Cloudflare's "Edit zone DNS" template does not include it.
+Read`, which Cloudflare's "Edit zone DNS" template does not include.
 
-**"No zone in this Cloudflare account matches ..."** — the installer prints
-every zone the token *can* see. Usually a typo, or the token's Zone Resources
-not including this domain.
+**"No zone in this Cloudflare account matches ..."** — the installer lists every
+zone the token can see. This is usually a typo in the domain, or Zone Resources
+on the token not including it.
 
-**"Cloudflare is rate-limiting this token"** — several failed attempts in a row
-trigger an undocumented lockout. The token is probably fine; wait a few minutes.
+**"Cloudflare is rate-limiting this token"** — repeated authentication failures
+trigger a temporary lockout. The token itself is usually valid; wait a few
+minutes before retrying.
 
 **`lego` reports "could not find zone"** — lego resolves the zone apex through
 the system resolver, which fails on networks running Pi-hole, AdGuard,
 split-horizon DNS, or a router that hijacks port 53. The installer pins public
-resolvers for the challenge lookup to avoid this; change `DNS_RESOLVERS` in the
-config if your network needs something else.
+resolvers for the challenge lookup to avoid this. Adjust `DNS_RESOLVERS` in the
+configuration file if a different resolver is required.
 
-**A service is still serving the old certificate** — see
-[Replace or create new?](#replace-or-create-new). Fix it in Control Panel →
+**A service is still using the old certificate** — see
+[Replace or create new?](#replace-or-create-new). Reassign it in Control Panel →
 Security → Certificate → Settings, or re-run the installer and choose replace.
 
-**After a DSM major upgrade** — re-run the installer. It is idempotent, and
-DSM upgrades have been known to remove things from `/usr/local`.
+**After a major DSM upgrade** — re-run the installer. It is idempotent, and DSM
+upgrades have been known to remove files from `/usr/local`.
 
 ---
 
@@ -231,10 +259,10 @@ sudo ./uninstall.sh            # keep the certificate, config and ACME account
 sudo ./uninstall.sh --purge    # remove them too
 ```
 
-The certificate already installed in DSM is left alone either way — removing
-this tool should not drop your NAS back to a self-signed certificate.
+The certificate already installed in DSM is left in place in both cases, so
+removing this tool does not revert the NAS to a self-signed certificate.
 
-Delete the Cloudflare token yourself at
+The Cloudflare API token should be deleted separately at
 [dash.cloudflare.com](https://dash.cloudflare.com/profile/api-tokens).
 
 ---
@@ -244,17 +272,6 @@ Delete the Cloudflare token yourself at
 - Synology DSM 7.0 or later (developed against 7.3)
 - A domain hosted on Cloudflare
 - SSH access with an account that can `sudo`
-
----
-
-## Documentation
-
-- [`docs/architecture.md`](docs/architecture.md) — how it works and why
-- [`docs/findings-dsm-privileges.md`](docs/findings-dsm-privileges.md) — what a
-  DSM 7.3 package is allowed to do, measured on hardware
-- [`docs/adr/`](docs/adr/) — decision records
-- [`docs/open-questions.md`](docs/open-questions.md) — what is still unsettled
-- [`tools/`](tools/) — diagnostic probes
 
 ---
 
