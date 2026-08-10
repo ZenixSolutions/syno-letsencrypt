@@ -1,0 +1,50 @@
+# syno-letsencrypt — Container Manager -> Project -> Create, and paste this.
+#
+# The container mounts nothing from the NAS and holds no host capabilities.
+# It reaches out to Cloudflare and Let's Encrypt, then asks DSM to install the
+# certificate through the same API Control Panel uses. Everything privileged is
+# done by DSM, on its own side of an authenticated request.
+
+services:
+  syno-letsencrypt:
+    image: ghcr.io/zenixsolutions/syno-letsencrypt:latest
+    container_name: syno-letsencrypt
+    restart: unless-stopped
+    environment:
+      # ---- Cloudflare -------------------------------------------------------
+      # Create at dash.cloudflare.com -> My Profile -> API Tokens -> Create Token.
+      # Start from the "Edit zone DNS" template, then ADD a second permission
+      # row: Zone -> Zone -> Read. The template does not include it, and
+      # without it the certificate cannot be issued.
+      CLOUDFLARE_DNS_API_TOKEN: "REPLACE_ME"
+
+      # ---- Certificate ------------------------------------------------------
+      DOMAINS: "example.com,*.example.com"
+      ACME_EMAIL: "you@example.com"
+
+      # ---- DSM --------------------------------------------------------------
+      # 172.17.0.1 is the Docker bridge gateway: the NAS itself, as seen from
+      # inside the container. Plain HTTP on 5000 keeps the traffic on the local
+      # bridge and avoids chicken-and-egg TLS errors while the certificate being
+      # replaced is the one DSM is serving.
+      DSM_URL: "http://172.17.0.1:5000"
+      DSM_USERNAME: "svc-letsencrypt"
+      DSM_PASSWORD: "REPLACE_ME"
+
+      # ---- Options ----------------------------------------------------------
+      # Leave STAGING true for the first run: it issues an untrusted test
+      # certificate with no rate limits, so a misconfiguration costs nothing.
+      # Let's Encrypt allows only 5 duplicate certificates per week in production.
+      STAGING: "true"
+      SET_DEFAULT: "true"
+      RENEW_DAYS: "30"
+      CHECK_INTERVAL: "43200"
+      TZ: "America/Denver"
+
+    volumes:
+      # Holds the ACME account key and issued certificates. Keep it: losing it
+      # forces re-registration and burns issuance rate limit.
+      - syno-letsencrypt-data:/data
+
+volumes:
+  syno-letsencrypt-data:

@@ -1,14 +1,13 @@
 #!/usr/bin/env bash
 #
-# syno-letsencrypt — Let's Encrypt certificates for Synology DSM via Cloudflare
-# DNS-01, installed straight into DSM's certificate store.
+# syno-letsencrypt — Let's Encrypt certificates for Synology DSM, issued over
+# the Cloudflare DNS-01 challenge and installed through DSM's own Web API.
 #
 # Subcommands:
-#   setup          Mint a scoped Cloudflare token from a bootstrap token.
-#   issue          Obtain a certificate and install it into DSM.
-#   renew          Renew if near expiry, then install. Safe to run daily.
-#   status         Show configuration and certificate expiry.
-#   revoke-token   Delete the Cloudflare token this host created.
+#   check    Validate configuration, Cloudflare token and DSM login. Changes nothing.
+#   issue    Obtain a certificate and install it into DSM.
+#   renew    Renew if within the window, install only if it actually changed.
+#   status   Show configuration and certificate expiry.
 #
 set -euo pipefail
 
@@ -20,51 +19,38 @@ readonly LIB_DIR="${SELF_DIR}/../lib"
 . "${LIB_DIR}/log.sh"
 # shellcheck source=../lib/cloudflare.sh
 . "${LIB_DIR}/cloudflare.sh"
-# shellcheck source=../lib/dsm.sh
-. "${LIB_DIR}/dsm.sh"
+# shellcheck source=../lib/dsm-api.sh
+. "${LIB_DIR}/dsm-api.sh"
 
 # --------------------------------------------------------------------------
-# Paths
-#
-# Under DSM these resolve inside the package's FHS directories. PKG_ROOT is
-# overridable so the same script can be exercised outside a NAS in tests.
+# Configuration — all environment, because this runs as a container.
 # --------------------------------------------------------------------------
-PKG_NAME="${SYNOPKG_PKGNAME:-syno-letsencrypt}"
-PKG_ROOT="${SYNOLE_PKG_ROOT:-/var/packages/${PKG_NAME}}"
+DATA="${SYNOLE_DATA:-/data}"
+readonly LEGO_DATA="${DATA}/lego"
+readonly STATE="${DATA}/state"
 
-readonly CONFIG_FILE="${PKG_ROOT}/var/config"
-readonly SECRET_FILE="${PKG_ROOT}/home/cloudflare.env"   # 0600, package-owned
-readonly TOKEN_META="${PKG_ROOT}/home/cloudflare.token-id"
-readonly LEGO_DATA="${PKG_ROOT}/var/lego"
-readonly LEGO_BIN="${SELF_DIR}/lego"
+# Declared here so the linter and the reader both know these come from the
+# container environment, and so an unset one fails loudly rather than silently.
+CLOUDFLARE_DNS_API_TOKEN="${CLOUDFLARE_DNS_API_TOKEN:-}"
+DSM_URL="${DSM_URL:-}"
+DSM_USERNAME="${DSM_USERNAME:-}"
+DSM_PASSWORD="${DSM_PASSWORD:-}"
 
-# Certificates are identified in DSM by this description. Renewals match on it
-# so they replace the existing entry instead of piling up a new certificate
-# every 60 days.
-readonly DSM_CERT_DESC="Let's Encrypt (syno-letsencrypt)"
+DOMAINS="${DOMAINS:-}"
+ACME_EMAIL="${ACME_EMAIL:-}"
+STAGING="${STAGING:-false}"
+SET_DEFAULT="${SET_DEFAULT:-true}"
+RENEW_DAYS="${RENEW_DAYS:-30}"
 
-# --------------------------------------------------------------------------
+# How DSM identifies this certificate. Renewals match on it so they replace the
+# existing entry rather than adding one every 60 days. Configurable in case a
+# NAS runs more than one instance.
+# Kept in its own variable: an apostrophe inside ${VAR:-default} is legal but
+# reads as an unterminated quote to both humans and linters.
+DEFAULT_CERT_DESC="Let's Encrypt (syno-letsencrypt)"
+CERT_DESC="${CERT_DESC:-${DEFAULT_CERT_DESC}}"
 
-usage() {
-    sed -n '3,14p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
-}
-
-load_config() {
-    [ -r "${CONFIG_FILE}" ] || die "Not configured yet. Reinstall the package, or run: ${0##*/} setup"
-    # shellcheck disable=SC1090
-    . "${CONFIG_FILE}"
-    [ -n "${DOMAINS:-}" ] || die "No domains configured in ${CONFIG_FILE}"
-}
-
-load_secret() {
-    [ -r "${SECRET_FILE}" ] || die "No Cloudflare credentials found. Run: ${0##*/} setup"
-    # shellcheck disable=SC1090
-    . "${SECRET_FILE}"
-    [ -n "${CLOUDFLARE_DNS_API_TOKEN:-}" ] || die "Cloudflare token missing from ${SECRET_FILE}"
-}
-
-# primary_domain — the first name in DOMAINS, with any wildcard prefix removed.
-# This is what we look the zone up by and what names the certificate.
+# primary_domain — first entry in DOMAINS, wildcard prefix stripped.
 primary_domain() {
     local first="${DOMAINS%%,*}"
     first="${first# }"; first="${first% }"
@@ -72,70 +58,49 @@ primary_domain() {
 }
 
 # --------------------------------------------------------------------------
-# setup — exchange a bootstrap token for a scoped one
+# check
 # --------------------------------------------------------------------------
-cmd_setup() {
-    local bootstrap="${CF_BOOTSTRAP_TOKEN:-}"
-    [ -n "${bootstrap}" ] || die "CF_BOOTSTRAP_TOKEN is not set."
+cmd_check() {
+    local failed=0
 
-    load_config
-    local domain zone_info zone_id account_id zone_name minted token_id
+    log_info "--- Configuration ---"
+    log_info "Domains:     ${DOMAINS}"
+    log_info "ACME email:  ${ACME_EMAIL}"
+    log_info "Environment: $([ "${STAGING}" = "true" ] && echo 'STAGING (test certificates)' || echo production)"
+    log_info "DSM:         ${DSM_URL:-<unset>} as ${DSM_USERNAME:-<unset>}"
+    log_info ""
 
-    domain="$(primary_domain)"
-    log_info "Validating the Cloudflare setup token ($(redact "${bootstrap}"))"
-    cf_preflight_bootstrap "${bootstrap}" || return 1
+    log_info "--- Cloudflare ---"
+    cf_check_token "${CLOUDFLARE_DNS_API_TOKEN}" "$(primary_domain)" >/dev/null || failed=1
+    log_info ""
 
-    log_info "Finding the Cloudflare zone that owns ${domain}"
-    zone_info="$(cf_find_zone "${bootstrap}" "${domain}")" || return 1
-    read -r zone_id account_id zone_name <<<"${zone_info}"
-    log_info "Zone: ${zone_name} (${zone_id})"
-
-    log_info "Creating a DNS-only token scoped to ${zone_name}"
-    minted="$(cf_mint_token "${bootstrap}" "${zone_id}" "${account_id}" \
-        "syno-letsencrypt $(hostname -s 2>/dev/null || echo nas) ${zone_name}")" || return 1
-
-    # The secret is returned exactly once. Persist it before anything else can
-    # fail, or it is unrecoverable and we have orphaned a token on the account.
-    mkdir -p "$(dirname "${SECRET_FILE}")"
-    ( umask 077; printf 'CLOUDFLARE_DNS_API_TOKEN=%s\n' "${minted}" > "${SECRET_FILE}" )
-    chmod 0600 "${SECRET_FILE}"
-    log_info "Token stored at ${SECRET_FILE} (0600)"
-
-    # Record the id so we can revoke exactly this token on uninstall.
-    if token_id="$(cf_api "${minted}" GET /user/tokens/verify | jq -r '.result.id')"; then
-        printf '%s\n' "${token_id}" > "${TOKEN_META}"
-        chmod 0600 "${TOKEN_META}"
+    log_info "--- DSM ---"
+    if dsm_login; then
+        # Listing certificates is the cheapest call that proves the account is
+        # genuinely an administrator — the usual misconfiguration.
+        dsm_find_cert_id "${CERT_DESC}" >/dev/null \
+            && log_info "DSM account can manage certificates."
+        dsm_logout
+    else
+        failed=1
     fi
-
-    if ! cf_selftest_token "${minted}" "${zone_id}" "${zone_name}"; then
-        log_error "The new token does not work as expected; removing it."
-        [ -n "${token_id:-}" ] && cf_revoke_token "${bootstrap}" "${token_id}"
-        rm -f "${SECRET_FILE}" "${TOKEN_META}"
-        return 1
-    fi
-
-    # Cache the zone so renewals never depend on discovery again.
-    printf 'CF_ZONE_ID=%s\nCF_ZONE_NAME=%s\nCF_ACCOUNT_ID=%s\n' \
-        "${zone_id}" "${zone_name}" "${account_id}" >> "${CONFIG_FILE}"
 
     log_info ""
-    log_info "Cloudflare setup complete."
-    log_info "You can now delete the setup token in the Cloudflare dashboard —"
-    log_info "it is not stored anywhere on this NAS."
+    if [ "${failed}" -eq 0 ]; then
+        log_info "All checks passed."
+    else
+        log_error "One or more checks failed."
+    fi
+    return "${failed}"
 }
 
 # --------------------------------------------------------------------------
 # issue / renew
 # --------------------------------------------------------------------------
-
-# run_lego <lego-subcommand> [extra args...]
 run_lego() {
     local action="$1"; shift
-    local -a domain_args=()
-    local d
-
-    load_config
-    load_secret
+    local -a domain_args=() lego_args=()
+    local d r _domains
 
     IFS=',' read -ra _domains <<<"${DOMAINS}"
     for d in "${_domains[@]}"; do
@@ -143,7 +108,7 @@ run_lego() {
         [ -n "${d}" ] && domain_args+=(--domains "${d}")
     done
 
-    local -a lego_args=(
+    lego_args=(
         --accept-tos
         --email "${ACME_EMAIL}"
         --dns cloudflare
@@ -151,29 +116,28 @@ run_lego() {
         "${domain_args[@]}"
     )
 
-    [ "${STAGING:-false}" = "true" ] \
+    [ "${STAGING}" = "true" ] \
         && lego_args+=(--server https://acme-staging-v02.api.letsencrypt.org/directory)
 
-    # lego resolves the zone apex with a DNS SOA walk against the system
-    # resolver. On a network running Pi-hole, AdGuard, split-horizon DNS, or a
-    # router that hijacks port 53, that walk fails — and the error reads like a
-    # credentials problem. Pinning public resolvers for the challenge lookup
-    # sidesteps the entire class of failure.
-    lego_args+=(--dns.resolvers 1.1.1.1:53 --dns.resolvers 8.8.8.8:53)
+    # lego finds a domain's zone apex with SOA queries against the system
+    # resolver. On a network running Pi-hole, AdGuard or split-horizon DNS that
+    # walk fails, and the error it produces reads like a credentials problem.
+    # Pinning public resolvers for the challenge lookup removes the whole class.
+    for r in ${DNS_RESOLVERS:-1.1.1.1:53 8.8.8.8:53}; do
+        lego_args+=(--dns.resolvers "${r}")
+    done
 
     mkdir -p "${LEGO_DATA}"
-
-    log_info "Running lego ${action} for: ${DOMAINS}"
-    CLOUDFLARE_DNS_API_TOKEN="${CLOUDFLARE_DNS_API_TOKEN}" \
-        "${LEGO_BIN}" "${lego_args[@]}" "${action}" "$@"
+    log_info "lego ${action}: ${DOMAINS}"
+    CLOUDFLARE_DNS_API_TOKEN="${CLOUDFLARE_DNS_API_TOKEN}" lego "${lego_args[@]}" "${action}" "$@"
 }
 
-# cert_paths — echo "<cert> <key> <chain>" for the issued certificate.
+# cert_paths — prints "<cert> <key> <chain>".
 cert_paths() {
-    local name
+    local name base
     name="$(primary_domain)"
-    # lego sanitises a wildcard SAN to an underscore prefix on disk.
-    local base="${LEGO_DATA}/certificates/${name}"
+    base="${LEGO_DATA}/certificates/${name}"
+    # lego renames a certificate whose first SAN is a wildcard.
     [ -f "${base}.crt" ] || base="${LEGO_DATA}/certificates/_.${name}"
     printf '%s %s %s' "${base}.crt" "${base}.key" "${base}.issuer.crt"
 }
@@ -181,117 +145,96 @@ cert_paths() {
 install_into_dsm() {
     local cert key chain leaf
     read -r cert key chain <<<"$(cert_paths)"
+    [ -f "${cert}" ] || die "No certificate at ${cert}"
 
-    [ -f "${cert}" ] || die "No certificate found at ${cert}"
-
-    # lego writes cert.crt as leaf+chain. DSM wants the leaf on its own, so
-    # extract just the first certificate rather than handing DSM a bundle.
-    #
-    # Cleanup is an EXIT trap, not RETURN: bash RETURN traps are global rather
-    # than function-scoped, so they fire again on every subsequent function
-    # return with the local already out of scope.
+    # lego writes cert.crt as leaf + chain. DSM wants the leaf alone, so hand it
+    # just the first certificate rather than a bundle.
     leaf="$(mktemp)"
-    # shellcheck disable=SC2064  # expand ${leaf} now, on purpose
+    # shellcheck disable=SC2064  # expand now, deliberately
     trap "rm -f '${leaf}'" EXIT
     openssl x509 -in "${cert}" -out "${leaf}"
 
-    local as_default="false"
-    [ "${SET_DEFAULT:-false}" = "true" ] && as_default="true"
-
-    dsm_import_cert "${leaf}" "${key}" "${chain}" "${DSM_CERT_DESC}" "${as_default}"
+    dsm_login || return 1
+    dsm_import_cert "${leaf}" "${key}" "${chain}" "${CERT_DESC}" "${SET_DEFAULT}"
+    dsm_logout
 }
 
 cmd_issue() {
     run_lego run
     install_into_dsm
-    log_info "Done. Certificate issued and installed."
+    mkdir -p "${STATE}"
+    date -u '+%Y-%m-%dT%H:%M:%SZ' > "${STATE}/last-install"
+    log_info "Certificate issued and installed."
 }
 
 cmd_renew() {
-    local before after
-    read -r before _ _ <<<"$(cert_paths)"
-    local checksum_before=""
-    [ -f "${before}" ] && checksum_before="$(sha256sum "${before}" | cut -d' ' -f1)"
+    local cert before after
+    read -r cert _ _ <<<"$(cert_paths)"
 
-    # lego exits 0 when a certificate is still fresh, so compare content rather
-    # than exit status to decide whether DSM needs touching. Re-importing an
-    # unchanged certificate would restart nginx daily for no reason.
-    run_lego renew --days 30
+    if [ ! -f "${cert}" ]; then
+        log_info "No certificate yet; issuing for the first time."
+        cmd_issue
+        return
+    fi
 
-    read -r after _ _ <<<"$(cert_paths)"
-    local checksum_after=""
-    [ -f "${after}" ] && checksum_after="$(sha256sum "${after}" | cut -d' ' -f1)"
+    before="$(sha256sum "${cert}" | cut -d' ' -f1)"
+    run_lego renew --days "${RENEW_DAYS}"
+    read -r cert _ _ <<<"$(cert_paths)"
+    after="$(sha256sum "${cert}" | cut -d' ' -f1)"
 
-    if [ "${checksum_before}" = "${checksum_after}" ]; then
+    # lego exits 0 whether or not it renewed, so compare content. Re-importing
+    # an unchanged certificate would restart DSM's web server daily for nothing.
+    if [ "${before}" = "${after}" ]; then
         log_info "Certificate is still current; nothing to do."
         return 0
     fi
 
     log_info "Certificate was renewed; installing into DSM."
     install_into_dsm
+    mkdir -p "${STATE}"
+    date -u '+%Y-%m-%dT%H:%M:%SZ' > "${STATE}/last-install"
 }
 
 # --------------------------------------------------------------------------
-# status / revoke-token
-# --------------------------------------------------------------------------
 cmd_status() {
-    load_config
     local cert
     read -r cert _ _ <<<"$(cert_paths)"
 
     printf 'Domains:      %s\n' "${DOMAINS}"
-    printf 'ACME email:   %s\n' "${ACME_EMAIL:-<unset>}"
-    printf 'Environment:  %s\n' "$([ "${STAGING:-false}" = "true" ] && echo 'STAGING (test certificates)' || echo 'production')"
-    printf 'DSM default:  %s\n' "${SET_DEFAULT:-false}"
-    printf 'Cloudflare:   zone %s (%s)\n' "${CF_ZONE_NAME:-<unknown>}" "${CF_ZONE_ID:-<unknown>}"
+    printf 'Environment:  %s\n' "$([ "${STAGING}" = "true" ] && echo staging || echo production)"
+    printf 'DSM:          %s\n' "${DSM_URL:-<unset>}"
 
-    if [ -f "${cert}" ]; then
-        printf 'Certificate:  %s\n' "${cert}"
-        printf 'Expires:      %s\n' \
-            "$(openssl x509 -in "${cert}" -noout -enddate | cut -d= -f2)"
-    else
+    if [ ! -f "${cert}" ]; then
         printf 'Certificate:  not yet issued\n'
+        return 1
     fi
 
-    if command -v systemctl >/dev/null 2>&1; then
-        printf 'Next renewal: %s\n' \
-            "$(systemctl list-timers --no-pager "pkg-${PKG_NAME}-renew.timer" 2>/dev/null \
-               | awk 'NR==2 {print $1, $2, $3}' || echo unknown)"
-    fi
-}
-
-cmd_revoke_token() {
-    [ -r "${TOKEN_META}" ] || { log_warn "No token id on record; nothing to revoke."; return 0; }
-    load_secret
-    local token_id
-    token_id="$(cat "${TOKEN_META}")"
-
-    # A token with only DNS Write + Zone Read cannot delete itself, so this
-    # needs a bootstrap token again. Report clearly rather than failing silently.
-    if [ -n "${CF_BOOTSTRAP_TOKEN:-}" ]; then
-        cf_revoke_token "${CF_BOOTSTRAP_TOKEN}" "${token_id}"
+    printf 'Certificate:  %s\n' "${cert}"
+    printf 'Subject:      %s\n' "$(openssl x509 -in "${cert}" -noout -subject | cut -d= -f2-)"
+    printf 'Expires:      %s\n' "$(openssl x509 -in "${cert}" -noout -enddate | cut -d= -f2)"
+    if openssl x509 -in "${cert}" -noout -checkend $(( RENEW_DAYS * 86400 )) >/dev/null 2>&1; then
+        printf 'Renewal:      not due\n'
     else
-        log_warn "Cannot revoke automatically: the scoped token has no permission to delete itself."
-        log_warn "Delete token id ${token_id} at https://dash.cloudflare.com/profile/api-tokens"
+        printf 'Renewal:      due\n'
     fi
+
+    [ -f "${STATE}/last-install" ] \
+        && printf 'Last install: %s\n' "$(cat "${STATE}/last-install")"
+    return 0
 }
 
-# --------------------------------------------------------------------------
+usage() { sed -n '3,11p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
 
 main() {
     local cmd="${1:-}"
     [ $# -gt 0 ] && shift
-
-    command -v jq >/dev/null 2>&1 || die "jq is required but not on PATH."
-
     case "${cmd}" in
-        setup)        cmd_setup "$@" ;;
-        issue)        cmd_issue "$@" ;;
-        renew)        cmd_renew "$@" ;;
-        status)       cmd_status "$@" ;;
-        revoke-token) cmd_revoke_token "$@" ;;
+        check)  cmd_check "$@" ;;
+        issue)  cmd_issue "$@" ;;
+        renew)  cmd_renew "$@" ;;
+        status) cmd_status "$@" ;;
         -h|--help|help|'') usage ;;
-        *)            die "Unknown command: ${cmd}. Try --help." ;;
+        *) die "Unknown command: ${cmd}" ;;
     esac
 }
 
