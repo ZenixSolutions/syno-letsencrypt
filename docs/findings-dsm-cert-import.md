@@ -1,0 +1,99 @@
+# What SYNO.Core.Certificate import actually accepts
+
+Measured on **DSM 7.3-86009**, by changing one parameter at a time against a
+real NAS. Everything here is an observation, not a reading of documentation —
+Synology publishes none for this endpoint.
+
+## The headline
+
+**Error 5511 does not mean the private key is malformed.**
+
+DSM returns it for at least one condition that has nothing to do with the key,
+and it returns it identically whatever the key contains. That single misleading
+code cost an evening and produced three wrong diagnoses, in this order:
+
+1. *"lego writes SEC1 keys and DSM wants PKCS#8."* Converting the key changed
+   nothing.
+2. *"DSM's import won't accept elliptic-curve keys at all."* A fresh RSA-2048
+   key produced the identical error.
+3. *"DSM protects certificates its own ACME client manages."* Replacing a
+   certificate we had created ourselves minutes earlier failed the same way.
+
+Each was plausible, each explained the evidence in hand, and each was reasoning
+from a single difference noticed in isolation. The actual cause was a fourth
+difference nobody had listed.
+
+## The actual rule
+
+`as_default=true` is refused. That is the whole finding.
+
+    api=SYNO.Core.Certificate method=import version=1
+        key_tmp=<path> cert_tmp=<path> inter_cert_tmp=<path>
+        desc=<string> id=<cert id>
+        as_default=true              <-- 5511
+
+Drop that one argument and the identical call succeeds, replacing the
+certificate in place and preserving its service assignments.
+
+## What was ruled out, and stays ruled out
+
+Each of these was tested by holding everything else constant. They are recorded
+because a future change might otherwise re-introduce one as a "fix".
+
+| Suspected | Verdict |
+| --- | --- |
+| SEC1 vs PKCS#8 key encoding | Irrelevant. Both refused, both accepted. |
+| EC vs RSA key type | Irrelevant. `ec256` and `rsa2048` behave identically. |
+| Temp file path, name, extension | Irrelevant. `mktemp`'s `/tmp/tmp.AbC123` works. |
+| Temp file permissions (0600) | Irrelevant. root reads them fine. |
+| Replacing vs creating | Both work. `id=` is accepted. |
+| DSM-managed certificates being protected | No such protection observed. |
+
+`--key-type rsa2048` remains the default, but for interoperability rather than
+necessity: it was adopted while chasing hypothesis 2 and there is no measured
+reason to prefer it. An EC key imports successfully.
+
+## The JSON type trap
+
+`synowebapi --exec-fastwebapi` parses **every** `key=value` argument as JSON,
+falling back to raw text when the value is not valid JSON. Two consequences,
+both of which produce silent corruption or nonsense errors rather than a clear
+complaint:
+
+- A certificate id like `8ec29f37` is valid JSON — as **scientific notation**.
+  String values must be explicitly quoted, which is what `jstr` in `dsm.sh` is
+  for.
+- `as_default=true` arrives as a JSON **boolean**, not the string `"true"`.
+
+Whether the second one is the reason `as_default` is rejected is the open
+question `tools/probe-cert-default.sh` exists to answer. If it is, this is the
+same mistake in two different parameters, and worth checking for in any
+parameter added later.
+
+## Reading errors from this API
+
+`success: true` is not proof that anything changed. `SYNO.Core.Certificate.Service`
+has been observed reporting success while making no change at all, which is why
+`dsm_assign_services` re-reads the certificate afterwards rather than trusting
+the reply. Treat every write to this API family as unverified until read back.
+
+Known codes, with the caveat that 5511 demonstrably lies:
+
+| Code | Nominal meaning | Trust it? |
+| --- | --- | --- |
+| 105 | caller is not an administrator | yes |
+| 5503 | service assignment payload rejected | yes |
+| 5510 | certificate file malformed | untested |
+| 5511 | private key malformed | **no** — also means `as_default` was sent |
+| 5512 | intermediate certificate rejected | untested |
+| 5513 | incomplete chain | untested |
+| 5514 | key does not match certificate | untested |
+
+## Method
+
+Every claim above comes from a probe that changes one variable against a
+control that is known to fail. `tools/probe-cert-replace.sh` is the one that
+found this; it refuses to interpret its own results if the reproduction case
+does not itself fail, because a matrix built on a passing control proves
+nothing. That property is the reason it succeeded where three rounds of
+plausible reasoning did not.
