@@ -287,7 +287,7 @@ readonly SOURCE_FILES=(
     "src/lib/schedule.sh"
     "src/lib/dns.sh"
     "src/lib/ui.sh"
-    "src/bin/syno-letsencrypt"
+    "src/bin/zenix-cert"
     "docs/banner.txt"
 )
 
@@ -321,7 +321,7 @@ obtain_source() {
         # would otherwise be sourced as shell. Cheap sanity check, skipped for
         # the ASCII wordmark, which is not a script.
         case "${f}" in
-            *.sh|*/syno-letsencrypt)
+            *.sh|*/zenix-cert)
                 head -n1 "${SRC_DIR}/${f}" | grep -q '^#' \
                     || die "${f} does not look like a shell script. Something is intercepting the download."
                 ;;
@@ -572,8 +572,25 @@ install_files() {
     # The CLI draws the wordmark as a progress indicator while waiting for DNS.
     install -m 644 -o root -g root "${SRC_DIR}/docs/banner.txt" \
         /usr/local/share/syno-letsencrypt/banner.txt
-    install -m 755 -o root -g root "${SRC_DIR}/src/bin/syno-letsencrypt" "${BIN_DIR}/syno-letsencrypt"
-    ok "installed ${BIN_DIR}/syno-letsencrypt"
+    install -m 755 -o root -g root "${SRC_DIR}/src/bin/zenix-cert" "${BIN_DIR}/zenix-cert"
+    ok "installed ${BIN_DIR}/zenix-cert"
+    remove_legacy_binary
+}
+
+# The command used to be called syno-letsencrypt, which collides with a command
+# DSM itself ships — DSM's wins on PATH, so ours was unreachable interactively.
+# Remove the old copy rather than leave a shadowed binary behind. Only the one
+# under /usr/local/bin, and only if it is recognisably ours; DSM's own lives
+# elsewhere and is never touched.
+remove_legacy_binary() {
+    local old="${BIN_DIR}/syno-letsencrypt"
+    [ -f "${old}" ] || return 0
+    if grep -q "Cloudflare DNS-01 challenge" "${old}" 2>/dev/null; then
+        rm -f "${old}"
+        ok "removed the old ${old}, which DSM's own command was shadowing"
+    else
+        warn "${old} exists but is not ours; leaving it alone"
+    fi
 }
 
 write_config() {
@@ -729,7 +746,7 @@ main() {
     say ""
 
     if [ "${confirm_issue}" = "true" ]; then
-        if "${BIN_DIR}/syno-letsencrypt" issue; then
+        if "${BIN_DIR}/zenix-cert" issue; then
             say ""
             ok "Certificate issued and installed into DSM."
             if [ "${STAGING_IN}" = "true" ]; then
@@ -738,21 +755,21 @@ main() {
                 say  "     When you are happy, switch to the real one:"
                 say  ""
                 say  "         sudo sed -i 's/STAGING=\"true\"/STAGING=\"false\"/' ${CONFIG}"
-                say  "         sudo syno-letsencrypt issue"
+                say  "         sudo zenix-cert issue"
             fi
         else
             say ""
             fail "Issuance failed. Nothing else was changed; fix the above and run:"
-            say  "     sudo syno-letsencrypt issue"
+            say  "     sudo zenix-cert issue"
         fi
     else
-        say "When you are ready:  sudo syno-letsencrypt issue"
+        say "When you are ready:  sudo zenix-cert issue"
     fi
 
     say ""
-    dim "  sudo syno-letsencrypt status    expiry and next scheduled run"
-    dim "  sudo syno-letsencrypt check     re-validate the token, change nothing"
-    dim "  sudo syno-letsencrypt renew     what the scheduled task runs"
+    dim "  sudo zenix-cert status    expiry and next scheduled run"
+    dim "  sudo zenix-cert check     re-validate the token, change nothing"
+    dim "  sudo zenix-cert renew     what the scheduled task runs"
     say ""
     dim "  Renewal is visible in Control Panel > Task Scheduler."
     say ""

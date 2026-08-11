@@ -16,10 +16,17 @@
 
 # Kept in two steps: an apostrophe inside ${VAR:-default} is legal but parses
 # as an unterminated quote to both linters and readers.
-_SCHED_DEFAULT_NAME="Let's Encrypt renewal (syno-letsencrypt)"
+_SCHED_DEFAULT_NAME="Let's Encrypt renewal (zenix-cert)"
 SCHED_TASK_NAME="${SCHED_TASK_NAME:-${_SCHED_DEFAULT_NAME}}"
 readonly SCHED_TASK_NAME
-readonly SCHED_COMMAND="/usr/local/bin/syno-letsencrypt renew"
+readonly SCHED_COMMAND="/usr/local/bin/zenix-cert renew"
+
+# Task names used before the command was renamed away from syno-letsencrypt,
+# which collided with DSM's own command of that name. Matching is by name, so
+# without this an upgrade would leave the old task in place and add a second
+# one beside it — two renewals a day, one of them pointing at a binary that no
+# longer exists.
+readonly SCHED_LEGACY_NAME="Let's Encrypt renewal (syno-letsencrypt)"
 
 # Daily. repeat_date 1001 is the "daily" modality; week_day lists every day.
 # The hour is randomised per install so that a fleet of NAS boxes running this
@@ -43,17 +50,17 @@ sched_extra_json() {
         '{ notify_enable: $n, notify_mail: $m, notify_if_error: true, script: $s }'
 }
 
-# sched_find_task_id — id of our task, or nothing. Matched on name, because
-# DSM does not enforce unique task names and we must not stack duplicates on
-# a re-install.
+# sched_find_task_id [name] — id of a task by name, or nothing. Matched on name
+# because DSM does not enforce unique task names and we must not stack
+# duplicates on a re-install.
 sched_find_task_id() {
-    local out
+    local want="${1:-${SCHED_TASK_NAME}}" out
     out="$(/usr/syno/bin/synowebapi --exec-fastwebapi \
         api=SYNO.Core.TaskScheduler method=list version=3 \
         offset=0 limit=200 2>/dev/null)" || return 0
 
     printf '%s' "${out}" \
-        | jq -r --arg n "${SCHED_TASK_NAME}" \
+        | jq -r --arg n "${want}" \
             '.data.tasks[]? | select(.name == $n) | .id' 2>/dev/null \
         | head -n1
 }
@@ -68,6 +75,18 @@ sched_install() {
     # Spread across the small hours rather than all landing at 03:00.
     hour=$(( RANDOM % 5 + 1 ))
     minute=$(( RANDOM % 60 ))
+
+    # Clear out a task left by the pre-rename version before adding ours.
+    local legacy
+    legacy="$(sched_find_task_id "${SCHED_LEGACY_NAME}")"
+    if [ -n "${legacy}" ]; then
+        if /usr/syno/bin/synoschedtask --del "id=${legacy}" >/dev/null 2>&1; then
+            log_info "Removed the old '${SCHED_LEGACY_NAME}' task."
+        else
+            log_warn "Could not remove the old task ${legacy}; delete it in Control Panel"
+            log_warn "> Task Scheduler or renewal will run twice."
+        fi
+    fi
 
     existing="$(sched_find_task_id)"
     schedule="$(sched_schedule_json "${hour}" "${minute}")"
@@ -131,20 +150,19 @@ TXT
 
 # sched_remove — used by the uninstaller. synoschedtask does support --del.
 sched_remove() {
-    local id
-    id="$(sched_find_task_id)"
-    if [ -z "${id}" ]; then
-        log_info "No Task Scheduler entry to remove."
-        return 0
-    fi
-    if /usr/syno/bin/synoschedtask --del "id=${id}" >/dev/null 2>&1; then
-        log_info "Removed Task Scheduler entry ${id}."
-    else
-        log_warn "Could not remove task ${id}. Delete '${SCHED_TASK_NAME}' in Control Panel > Task Scheduler."
-    fi
+    local id name
+    for name in "${SCHED_TASK_NAME}" "${SCHED_LEGACY_NAME}"; do
+        id="$(sched_find_task_id "${name}")"
+        [ -n "${id}" ] || continue
+        if /usr/syno/bin/synoschedtask --del "id=${id}" >/dev/null 2>&1; then
+            log_info "Removed Task Scheduler entry ${id} (${name})."
+        else
+            log_warn "Could not remove task ${id}. Delete '${name}' in Control Panel > Task Scheduler."
+        fi
+    done
 }
 
-# sched_status — one line for `syno-letsencrypt status`.
+# sched_status — one line for `zenix-cert status`.
 sched_status() {
     local id out
     id="$(sched_find_task_id)"

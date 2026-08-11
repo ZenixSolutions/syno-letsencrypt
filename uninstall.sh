@@ -40,6 +40,9 @@ if [ -f /etc/systemd/system/syno-letsencrypt.timer ]; then
 fi
 
 echo "Removing program files..."
+# syno-letsencrypt is the pre-rename name. DSM ships a command by that name too,
+# but its own lives outside /usr/local/bin and is not touched here.
+rm -f  /usr/local/bin/zenix-cert
 rm -f  /usr/local/bin/syno-letsencrypt
 rm -rf /usr/local/share/syno-letsencrypt
 

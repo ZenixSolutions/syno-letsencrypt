@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
-# syno-letsencrypt — Let's Encrypt certificates for Synology DSM, over the
-# Cloudflare DNS-01 challenge, installed straight into DSM.
+# zenix-cert — Let's Encrypt certificates for Synology DSM, over the Cloudflare
+# DNS-01 challenge, installed straight into DSM.
 #
 # Subcommands:
 #   check    Validate the Cloudflare token and DSM access. Changes nothing.
@@ -10,6 +10,11 @@
 #   status   Show configuration, expiry, and when the next run is due.
 #
 # Runs as root. Installed by install.sh; the DSM scheduled task calls `renew`.
+#
+# Not named syno-letsencrypt: DSM ships a command by that name — the one behind
+# Control Panel's certificate feature — and it takes precedence on PATH, so a
+# tool installed under that name is unreachable interactively. Its `revoke`
+# subcommand also means something different, and destructive.
 #
 set -euo pipefail
 
@@ -89,7 +94,7 @@ PROPAGATION_WAIT="120"
 
 # How DSM labels this certificate in Control Panel. Renewals match on it, so
 # they replace the existing entry rather than adding a new one every 60 days.
-DEFAULT_CERT_DESC="Let's Encrypt (syno-letsencrypt)"
+DEFAULT_CERT_DESC="Let's Encrypt (zenix-cert)"
 CERT_DESC="${DEFAULT_CERT_DESC}"
 CERT_MODE="replace"
 CERT_REPLACE_ID=""
@@ -383,7 +388,12 @@ cmd_status() {
     return 0
 }
 
-usage() { sed -n '3,12p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+# Prints the header block, stopping before the note about the name. Extracted
+# by content rather than a fixed line range, which silently prints the wrong
+# thing the moment the header changes.
+usage() {
+    sed -n '3,/^# Runs as root/p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+}
 
 main() {
     local cmd="${1:-}"

@@ -199,7 +199,7 @@ cf_test_dns_write() {
     local token="$1" zone_id="$2" zone_name="$3"
     local payload out record_id
 
-    payload="$(jq -nc --arg n "_syno-letsencrypt-check.${zone_name}" \
+    payload="$(jq -nc --arg n "_zenix-cert-check.${zone_name}" \
         '{ type: "TXT", name: $n, content: "permission check - safe to delete", ttl: 120 }')"
 
     if ! out="$(cf_api "${token}" POST "/zones/${zone_id}/dns_records" "${payload}")"; then
@@ -212,7 +212,7 @@ cf_test_dns_write() {
 
     if ! cf_api "${token}" DELETE "/zones/${zone_id}/dns_records/${record_id}" >/dev/null; then
         log_warn "Created a test DNS record but could not remove it."
-        log_warn "Delete _syno-letsencrypt-check.${zone_name} manually in Cloudflare."
+        log_warn "Delete _zenix-cert-check.${zone_name} manually in Cloudflare."
     fi
     return 0
 }

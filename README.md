@@ -128,7 +128,7 @@ lookup — so a token built that way fails during setup.
 The installer verifies the token by exercising it rather than by querying its
 permissions, because a scoped Cloudflare token cannot introspect itself. It
 lists the account's zones, then creates and immediately deletes a TXT record at
-`_syno-letsencrypt-check.<zone>`. If either operation fails, the missing
+`_zenix-cert-check.<zone>`. If either operation fails, the missing
 permission is reported during setup rather than at the first renewal.
 
 The token is stored at `/usr/local/etc/syno-letsencrypt/config`, mode `0600`,
@@ -161,25 +161,28 @@ Renewals always replace in place, regardless of the choice made at install.
 
 ## Usage
 
+The command is `zenix-cert`. It is deliberately not called `syno-letsencrypt` —
+DSM ships a command by that name and it takes precedence on PATH.
+
 Renewal is automatic. Everything is also available on demand:
 
 ```sh
-sudo syno-letsencrypt status    # expiry, services, next scheduled run
-sudo syno-letsencrypt check     # re-validate the token and DSM access
-sudo syno-letsencrypt renew     # what the scheduled task runs
-sudo syno-letsencrypt issue     # force a fresh issuance
+sudo zenix-cert status    # expiry, services, next scheduled run
+sudo zenix-cert check     # re-validate the token and DSM access
+sudo zenix-cert renew     # what the scheduled task runs
+sudo zenix-cert issue     # force a fresh issuance
 ```
 
 Configuration is stored as plain shell at
 `/usr/local/etc/syno-letsencrypt/config`. It can be edited directly, followed by
-`syno-letsencrypt check` to revalidate.
+`zenix-cert check` to revalidate.
 
 ---
 
 ## Renewal
 
 The installer creates a **DSM Task Scheduler** entry named
-*"Let's Encrypt renewal (syno-letsencrypt)"*, running as root, daily, at a
+*"Let's Encrypt renewal (zenix-cert)"*, running as root, daily, at a
 randomised hour between 01:00 and 05:00.
 
 It appears in **Control Panel → Task Scheduler** alongside any other scheduled
@@ -217,7 +220,7 @@ releases.
 
 | Path | Contents |
 |---|---|
-| `/usr/local/bin/syno-letsencrypt` | the command |
+| `/usr/local/bin/zenix-cert` | the command |
 | `/usr/local/bin/lego` | ACME client |
 | `/usr/local/bin/jq` | only if DSM does not already ship it |
 | `/usr/local/share/syno-letsencrypt/lib/` | libraries |
