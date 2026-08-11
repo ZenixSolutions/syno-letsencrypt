@@ -289,6 +289,36 @@ cert_paths() {
     printf '%s %s %s' "${base}.crt" "${base}.key" "${base}.issuer.crt"
 }
 
+# services_wanted — the services the user chose, each carrying the certificate
+# that owns it RIGHT NOW.
+#
+# services.json is written once, at install time, and each object in it has an
+# `_old_id` recording who owned that service then. That value goes stale the
+# moment anything is reassigned -- including by our own previous run.
+#
+# Handing back a stale _old_id is not a harmless no-op. DSM has been observed
+# to clear a service's assignment outright rather than move it when the old
+# owner it is told about is not the owner it finds. So only the *selection* is
+# taken from the file; ownership is re-read from DSM on every call.
+services_wanted() {
+    local chosen
+    [ -s "${SERVICES_FILE}" ] || { printf '[]'; return 0; }
+
+    chosen="$(jq -c '[ .[] | .subscriber + "/" + .service ]' "${SERVICES_FILE}" 2>/dev/null)" \
+        || { printf '[]'; return 0; }
+    [ "$(printf '%s' "${chosen}" | jq 'length')" -gt 0 ] || { printf '[]'; return 0; }
+
+    # `. as $s` is not decoration. Inside ($want | index(...)) the input has
+    # been rebound to $want, so a bare .subscriber there reads a field off the
+    # array of keys and jq aborts. The same scoping mistake already cost this
+    # project a wrong zone match in cloudflare.sh.
+    dsm_services_with_owner \
+        | jq -c --argjson want "${chosen}" \
+            '[ .[] | . as $s
+               | select( ($want | index($s.subscriber + "/" + $s.service)) != null ) ]' \
+        2>/dev/null || printf '[]'
+}
+
 install_into_dsm() {
     local cert key chain leaf key8 target new_id
     read -r cert key chain <<<"$(cert_paths)"
@@ -324,11 +354,22 @@ install_into_dsm() {
     new_id="$(dsm_import_cert "${leaf}" "${key8}" "${chain}" \
                 "${CERT_DESC}" "${SET_DEFAULT}" "${target}")"
 
-    # Replacing preserves services automatically. A new entry does not, and
-    # as_default only moves the system default -- FTPS, Drive, VPN and friends
-    # stay on the old certificate until explicitly reassigned.
-    if [ -z "${target}" ] && [ -s "${SERVICES_FILE}" ] && [ -n "${new_id}" ]; then
-        dsm_assign_services "${new_id}" "$(cat "${SERVICES_FILE}")" || true
+    # Reconcile service assignment on every run, not only when creating a new
+    # entry. Replacing in place does preserve whatever the certificate already
+    # served, but that is not the same as serving what the user asked for: a
+    # certificate we created but never assigned anything to stays empty
+    # forever, and a service added later never gets picked up. as_default only
+    # moves the system default -- FTPS, Drive, VPN and friends sit still.
+    #
+    # Cheap when there is nothing to do: dsm_assign_services drops services
+    # already pointing at this certificate, so a renewal that changes nothing
+    # sends nothing.
+    local want=""
+    if [ -n "${new_id}" ]; then
+        want="$(services_wanted)"
+        if [ "$(printf '%s' "${want}" | jq 'length' 2>/dev/null || echo 0)" -gt 0 ]; then
+            dsm_assign_services "${new_id}" "${want}" || true
+        fi
     fi
 
     date -u '+%Y-%m-%dT%H:%M:%SZ' > "${STATE}"

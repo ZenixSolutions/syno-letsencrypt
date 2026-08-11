@@ -141,7 +141,8 @@ try() {
     printf '\n--- complete output, stderr included ---\n'
     out="$("${SYNOWEBAPI}" --exec-fastwebapi "${args[@]}" 2>&1)"; rc=$?
     printf '%s\n' "${out}"
-    printf '--- exit %s ---\n' "${rc}"
+    # -- so printf does not read a format string beginning with "-" as options.
+    printf -- '--- exit %s ---\n' "${rc}"
 
     rm -f "${k}" "${c}" "${i}"
 
