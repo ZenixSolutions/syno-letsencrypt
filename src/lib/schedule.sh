@@ -50,19 +50,57 @@ sched_extra_json() {
         '{ notify_enable: $n, notify_mail: $m, notify_if_error: true, script: $s }'
 }
 
+# The task list, fetched once. Several checks below need it and each
+# synowebapi call costs the better part of a second.
+_SCHED_LIST_CACHE=""
+sched_list_json() {
+    if [ -z "${_SCHED_LIST_CACHE}" ]; then
+        _SCHED_LIST_CACHE="$(/usr/syno/bin/synowebapi --exec-fastwebapi \
+            api=SYNO.Core.TaskScheduler method=list version=3 \
+            offset=0 limit=200 2>/dev/null | sed -n '/^[[:space:]]*{/,$p')"
+    fi
+    printf '%s' "${_SCHED_LIST_CACHE}"
+}
+sched_list_invalidate() { _SCHED_LIST_CACHE=""; }
+
 # sched_find_task_id [name] — id of a task by name, or nothing. Matched on name
 # because DSM does not enforce unique task names and we must not stack
 # duplicates on a re-install.
 sched_find_task_id() {
-    local want="${1:-${SCHED_TASK_NAME}}" out
-    out="$(/usr/syno/bin/synowebapi --exec-fastwebapi \
-        api=SYNO.Core.TaskScheduler method=list version=3 \
-        offset=0 limit=200 2>/dev/null)" || return 0
-
-    printf '%s' "${out}" \
+    local want="${1:-${SCHED_TASK_NAME}}"
+    sched_list_json \
         | jq -r --arg n "${want}" \
             '.data.tasks[]? | select(.name == $n) | .id' 2>/dev/null \
         | head -n1
+}
+
+# sched_find_ours — every task that actually invokes this tool.
+#   <id> current   runs zenix-cert
+#   <id> stale     runs the old syno-letsencrypt command, which is gone
+#
+# Names are not sufficient evidence. A task created before the rename still
+# exists, still shows as enabled in Control Panel, still looks entirely
+# healthy — and calls /usr/local/bin/syno-letsencrypt, which the installer
+# removes. It fails silently at 1am, which is strictly worse than no task at
+# all, because nothing ever prompts anyone to look.
+#
+# Deliberately format-agnostic: both the task's JSON and the raw output of
+# `synoschedtask --get` are searched as plain text. DSM has moved where the
+# script body lives between releases, and a check that quietly stops finding
+# the task is precisely the failure this exists to catch.
+sched_find_ours() {
+    local ids id blob
+    ids="$(sched_list_json | jq -r '.data.tasks[]?.id' 2>/dev/null)"
+    for id in ${ids}; do
+        blob="$(sched_list_json | jq -c --arg i "${id}" \
+                  '.data.tasks[]? | select((.id|tostring) == $i)' 2>/dev/null)"
+        blob="${blob}$(/usr/syno/bin/synoschedtask --get "id=${id}" 2>/dev/null)"
+        case "${blob}" in
+            *zenix-cert*)       printf '%s current\n' "${id}" ;;
+            *syno-letsencrypt*) printf '%s stale\n'   "${id}" ;;
+            *) ;;
+        esac
+    done
 }
 
 # sched_install [email] — create or update the task. Prints instructions and
@@ -76,16 +114,25 @@ sched_install() {
     hour=$(( RANDOM % 5 + 1 ))
     minute=$(( RANDOM % 60 ))
 
+    # The list is cached; anything below changes it.
+    sched_list_invalidate
+
     # Clear out a task left by the pre-rename version before adding ours.
+    # Matched by command rather than by name, since the name is exactly what
+    # a hand-edited or renamed task will not have.
     local legacy
-    legacy="$(sched_find_task_id "${SCHED_LEGACY_NAME}")"
+    legacy="$(sched_find_ours | awk '$2 == "stale" { print $1 }' | head -n1)"
+    if [ -z "${legacy}" ]; then
+        legacy="$(sched_find_task_id "${SCHED_LEGACY_NAME}")"
+    fi
     if [ -n "${legacy}" ]; then
         if /usr/syno/bin/synoschedtask --del "id=${legacy}" >/dev/null 2>&1; then
-            log_info "Removed the old '${SCHED_LEGACY_NAME}' task."
+            log_info "Removed task ${legacy}, which ran the old syno-letsencrypt command."
         else
-            log_warn "Could not remove the old task ${legacy}; delete it in Control Panel"
-            log_warn "> Task Scheduler or renewal will run twice."
+            log_warn "Could not remove task ${legacy}; delete it in Control Panel"
+            log_warn "> Task Scheduler or renewal will run twice, failing once."
         fi
+        sched_list_invalidate
     fi
 
     existing="$(sched_find_task_id)"
@@ -163,15 +210,42 @@ sched_remove() {
 }
 
 # sched_status — one line for `zenix-cert status`.
+#
+# Three distinct ways renewal can fail to happen, and they need different
+# advice, so they are reported separately rather than collapsed into one "no":
+# no task, a task calling the pre-rename command, and a task that exists but
+# is disabled. The last two both look fine in Control Panel.
 sched_status() {
-    local id out
-    id="$(sched_find_task_id)"
-    if [ -z "${id}" ]; then
-        printf 'Scheduled:    NO — renewal will not run. Re-run install.sh.\n'
+    local found current stale enabled
+    found="$(sched_find_ours)"
+    current="$(printf '%s\n' "${found}" | awk '$2 == "current" { print $1 }' | head -n1)"
+    stale="$(printf   '%s\n' "${found}" | awk '$2 == "stale"   { print $1 }' | head -n1)"
+
+    if [ -z "${current}" ]; then
+        if [ -n "${stale}" ]; then
+            printf 'Scheduled:    NO — task %s still runs the old syno-letsencrypt\n' "${stale}"
+            printf '              command, which no longer exists. Re-run install.sh.\n'
+        else
+            printf 'Scheduled:    NO — renewal will not run. Re-run install.sh.\n'
+        fi
         return 1
     fi
-    out="$(/usr/syno/bin/synoschedtask --get "id=${id}" 2>/dev/null)" || true
-    printf 'Scheduled:    yes (Task Scheduler id %s)\n' "${id}"
-    printf '%s' "${out}" | sed -n 's/^\s*\(Last work time\|State\|Status\).*/              &/p' 2>/dev/null || true
+
+    # A disabled task is not a scheduled task, however healthy it looks.
+    enabled="$(sched_list_json | jq -r --arg i "${current}" \
+                 '.data.tasks[]? | select((.id|tostring) == $i) | .enable' 2>/dev/null)"
+    if [ "${enabled}" = "false" ]; then
+        printf 'Scheduled:    NO — task %s exists but is DISABLED.\n' "${current}"
+        printf '              Enable it in Control Panel > Task Scheduler.\n'
+        return 1
+    fi
+
+    printf 'Scheduled:    yes (Task Scheduler id %s)\n' "${current}"
+    if [ -n "${stale}" ]; then
+        printf '              warning: task %s also runs the old command — delete it,\n' "${stale}"
+        printf '              or renewal is attempted twice and fails once.\n'
+    fi
+    /usr/syno/bin/synoschedtask --get "id=${current}" 2>/dev/null \
+        | sed -n 's/^[[:space:]]*\(Last work time\|State\|Status\).*/              &/p' 2>/dev/null || true
     return 0
 }
