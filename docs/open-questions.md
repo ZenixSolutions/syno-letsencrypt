@@ -2,67 +2,70 @@
 
 Ordered by what would cost most to get wrong.
 
-## 1. The repository must be public for the one-liner — **blocking**
+## 1. Unattended renewal has never run — **the last unproven path**
 
-`curl -fsSL https://raw.githubusercontent.com/ZenixSolutions/syno-letsencrypt/main/install.sh`
-returns 404 while the repository is private. Options:
+Everything has been exercised by hand. A production certificate has been
+issued, imported, made the system default and assigned to eight services, and
+`renew` has been confirmed to do nothing when the certificate is still current.
 
-1. **Make it public.** It contains no secrets and is MIT licensed. Simplest, and
-   the tool is only useful to people who can fetch it.
-2. **Keep it private** and document `git clone` with credentials instead. The
-   one-liner then only works for people with access.
-3. **Publish the installer alone** as a release asset or GitHub Pages file. Odd
-   split, but possible.
+What has not happened is the scheduled task firing on its own. Until it does,
+the renewal path is verified only under a terminal, with a TTY, with output on
+screen. Differences worth expecting: no TTY, so the progress rendering takes
+its non-interactive branch and lego writes straight through; a different
+environment and `PATH`; and failures visible only in Task Scheduler's run
+history.
 
-Needs a decision before the install instructions are true.
+Confirmation is `zenix-cert status` showing a last-run record where it
+currently reports `[No last run record]`.
 
-## 2. Not yet run end to end
+## 2. No way to install a certificate already on disk
 
-Nothing here has issued a certificate on real hardware. The first run should use
-**staging** — the installer defaults to it — because production allows only five
-duplicate certificates per week and a mistake found after burning them means
-waiting.
+The only command that pushes a certificate into DSM is `issue`, which first
+obtains a new one from Let's Encrypt. There is no way to re-run the DSM half
+alone.
 
-Specifically unverified:
+This matters because Let's Encrypt permits five duplicate certificates per week
+per hostname. During development, four separate situations called for
+re-installing an unchanged certificate — a failed import, a corrected
+parameter, a restored NAS — and each cost a certificate from that allowance.
 
-- `synowebapi --exec-fastwebapi ... method=import` argument form on DSM 7.3.
-  The interface is undocumented and was taken from a working third-party hook.
-  The probe confirmed the binary exists and runs as root; the import call itself
-  has not been exercised.
-- Whether the import replaces the existing certificate cleanly when matched by
-  description, rather than adding a duplicate.
-- Whether DSM's reload actually takes effect for all subscribers on 7.3, given
-  the dual ECC/RSA layout.
+A `zenix-cert install` subcommand would use the existing `install_into_dsm`
+path with no ACME traffic at all. It is the clearest gap in the command set.
 
-## 3. `curl | sudo bash`
+## 3. Failure is silent
 
-It asks for real trust: the user runs unreviewed code as root. Mitigations in
-place — the script is short and readable, fetched over HTTPS from a pinned ref,
-states what it will do before doing it, and `./install.sh` from a clone is
-always offered.
+A certificate tool that says nothing when renewal breaks eventually breaks
+quietly. The Task Scheduler entry is created with `notify_if_error` set and an
+address when one is given, so DSM will mail on a non-zero exit — but that has
+not been tested, and it only fires if the script actually exits non-zero.
 
-Worth considering: publishing a SHA-256 of `install.sh` per release so a careful
-user can verify before piping, and pinning the one-liner to a tag rather than
-`main` so a repository compromise cannot silently change what people run.
+Worth verifying deliberately: force a failure, confirm the mail arrives.
+`/usr/syno/bin/synonotify` is also available for DSM desktop notifications.
 
-## 4. `/etc/systemd/system` and DSM upgrades
+## 4. `curl | sudo bash`
 
-DSM major upgrades have been known to remove units from `/etc/systemd/system`.
-The installer is idempotent, so re-running restores everything — but the user
-has to notice. Options: document it, or have `status` warn when the timer is
-missing. The latter is cheap and worth doing.
+The installer asks the user to run unreviewed code as root. Mitigations in
+place: the script is short and readable, fetched over HTTPS, states what it
+will do before doing it, and `./install.sh` from a clone is always offered.
+
+Two improvements worth making before wider use:
+
+- publish a SHA-256 of `install.sh` per release, so a careful user can verify
+  before piping;
+- pin the one-liner to a tag rather than `main`, so a repository compromise
+  cannot silently change what people run.
 
 ## 5. Smaller things
 
-- **Notifications.** A cert tool that stays quiet when renewal breaks eventually
-  breaks quietly. DSM can send desktop and email notifications via
-  `/usr/syno/bin/synonotify`. Worth wiring into the failure path.
+- **The QuickConnect exclusion is untested.** It was added after the last
+  installer run, so nothing has yet confirmed it disappears from the picker.
 - **Multiple certificates.** One per NAS today, which covers nearly everyone.
-  More would need a config directory rather than a single file.
-- **Assigning the certificate to specific services.** It is imported and
-  optionally made DSM's default; assigning it to individual services is left to
-  Control Panel.
-- **Tests.** `test/` is still empty. The valuable ones are `cloudflare.sh`
-  against a stubbed `curl` — ambiguous zone matches, the empty-result trap, the
-  10502 lockout — and a `dsm.sh` harness with `synowebapi` stubbed.
-- **armv5.** Not supported. Those models cannot run DSM 7.
+  More would require a configuration directory rather than a single file.
+- **Tests.** `test/` is empty. The valuable ones are `cloudflare.sh` against a
+  stubbed `curl` — ambiguous zone matches, the empty-result trap, the `10502`
+  lockout — and a `dsm.sh` harness with `synowebapi` stubbed.
+- **DSM upgrades.** Major upgrades have been known to remove files from
+  `/usr/local`. The installer is idempotent, so re-running restores everything,
+  but the user has to notice. `status` reports whether the scheduled task
+  exists, which covers the most damaging case.
+- **armv5.** Not supported; those models cannot run DSM 7.

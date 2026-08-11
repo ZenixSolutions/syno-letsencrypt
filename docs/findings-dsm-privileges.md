@@ -56,22 +56,30 @@ longer installs), and starting a `User=root` systemd unit the package shipped
 
 Only actors that already have privilege:
 
-1. **DSM itself**, via its authenticated Web API. This is what we use. An
-   administrator credential is required, but nothing on the NAS runs as root on
-   our behalf and no host paths are touched.
-2. **A root task the user creates**, in Task Scheduler. Reliable, no stored
-   credentials, but a manual setup step.
+1. **A root shell**, which can invoke `synowebapi --exec-fastwebapi` directly.
+   DSM's certificate API then runs in-process as root, so no credential is
+   needed at all. **This is the design that was adopted** — see
+   [ADR 0002](adr/0002-root-install-script.md).
+2. **DSM's authenticated Web API over HTTP**, which requires a DSM
+   administrator account and its password stored somewhere. Workable, and what
+   the container design used, but a real security cost that running as root
+   removes entirely.
 3. **The Docker daemon**, which runs as root. A bind-mounted container can write
    the certificate files — confirmed — but cannot make nginx reload them without
    `privileged` + `pid: host` + `nsenter`, which is a container escape and hands
    the container full control of the NAS. Rejected on those grounds.
 
-## A note on the exposure this uncovered
+## A note on package CGIs and authentication
 
-The round-1 probe reported `SERVER_NAME: <public FQDN>`, `HTTPS: on`, and a
-public `REMOTE_ADDR` — the DSM UI on the test NAS is reachable from the
-internet. Anything served under `/webman/3rdparty/` inherits that, and DSM does
-**not** authenticate that path on a package's behalf. Combined with `login.cgi`
-being unusable and `initdata.cgi` being absent, a package CGI on 7.3 has no
-straightforward way to verify its caller — which is a good reason to keep
-secrets out of any HTTP-reachable surface entirely.
+Where the DSM interface is reachable from the internet — which the test NAS
+was, as the probe confirmed by reporting a public `REMOTE_ADDR` and
+`HTTPS: on` — anything served under `/webman/3rdparty/` inherits that
+exposure. DSM does **not** authenticate that path on a package's behalf.
+
+Combined with `login.cgi` being unusable by the package user and
+`initdata.cgi` being absent on 7.3, a package CGI has no straightforward way
+to verify who is calling it.
+
+This is a general argument against putting secrets behind a package CGI, and
+it applies regardless of the privilege findings above. The current design has
+no HTTP-reachable surface at all.

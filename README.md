@@ -21,10 +21,11 @@ automatically.**
 
 No inbound ports need to be opened, and no DSM credentials are stored.
 
-> **Status: working, lightly tested.** A production certificate has been issued,
-> imported into DSM, set as the system default and assigned to eight services on
-> hardware running DSM 7.3-86009. It has not yet survived an unattended renewal,
-> which is the next thing to prove. The installer defaults to the Let's Encrypt
+> **Status: working, lightly tested.** A production certificate has been issued
+> end to end on hardware running DSM 7.3-86009 — obtained, imported, set as the
+> system default and assigned to eight services, with the challenge records
+> cleaned up afterwards. It has not yet survived an *unattended* renewal, which
+> is the remaining unproven path. The installer defaults to the Let's Encrypt
 > staging environment; begin there.
 
 ---

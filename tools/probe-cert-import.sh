@@ -1,22 +1,28 @@
 #!/usr/bin/env bash
-# Find out why DSM answers 5511 to every private key it is offered.
+# Exercise DSM's certificate import directly, to diagnose a rejected key.
 #
 #   curl -fsSL https://raw.githubusercontent.com/ZenixSolutions/syno-letsencrypt/main/tools/probe-cert-import.sh | sudo bash
 #
-# Uses the certificate and key already sitting in the lego data directory, so
-# it costs no ACME traffic and no rate limit.
+# Uses the certificate and key already present in the lego data directory, so
+# it generates no ACME traffic and counts against no rate limit.
 #
-# The question
+# What it does
 # ------------
-# Error 5511 is "illegal key file". It did not change across an EC key in SEC1
-# form, the same key converted to PKCS#8, and a freshly issued RSA key. A
-# validation error that is completely insensitive to what it claims to be
-# validating is usually not about the key at all -- it is what the API says
-# when the key comes back empty because it never read the file.
+# Reports what lego wrote, whether the key and certificate actually pair, and
+# whether DSM's web API shares this process's /tmp namespace. It then attempts
+# the import four times, holding the key bytes constant and varying only how
+# the files are presented: directory, filename extension, permissions, and
+# replacing an existing certificate versus creating a new one.
 #
-# So this varies everything about how the file is PRESENTED, holding the key
-# itself constant, and prints DSM's complete reply each time -- including the
-# stderr that the tool normally discards.
+# DSM's complete reply is printed for each attempt, including the stderr that
+# the tool itself discards, since that output occasionally carries detail the
+# error code does not.
+#
+# It stops at the first success. A successful import has installed the
+# certificate for real, so this script changes state.
+#
+# Error 5511 is nominally "illegal key file" and does not reliably mean that.
+# See docs/findings-dsm-cert-import.md for what has already been excluded.
 
 set -u
 
@@ -177,11 +183,15 @@ rm -rf "${WORK}" "${CONFIG_DIR}/import"
 
 hdr "All four variants refused"
 cat <<'EOF'
-None of location, filename, permissions, or replace-vs-create changed the
-answer. That exhausts the presentation theory, and the next thing to question
-is the parameter names themselves -- whether this DSM build wants the key
-inline rather than as a path.
+Location, filename, permissions and replace-vs-create make no difference on
+this system, which rules out how the files are presented.
 
-Send the full output above.
+On DSM 7.3-86009 the remaining known cause of this error is an argument
+reaching the API with the wrong JSON type -- see
+docs/findings-dsm-cert-import.md. If that has been excluded too, the next
+thing to question is whether this DSM build expects the key inline rather
+than as a file path.
+
+Please include the full output above in any bug report.
 EOF
 exit 1
