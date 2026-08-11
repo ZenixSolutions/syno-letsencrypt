@@ -86,8 +86,17 @@ dsm_list_certs() {
     syno_api api=SYNO.Core.Certificate.CRT method=list version=1
 }
 
+# Field separator for the line-oriented helpers below: US, 0x1F.
+#
+# NOT a tab. `read` collapses runs of any IFS character that is whitespace,
+# and tab is whitespace — so a record with an empty field silently shifts
+# every field after it. A certificate with no description is not a rare case:
+# it is exactly what DSM's own Let's Encrypt client produces, so the picker
+# mislabelled the one certificate a user is most likely to be replacing.
+readonly DSM_FS=$'\x1f'
+
 # dsm_cert_summary — one line per certificate, for a picker.
-#   <id>\t<description>\t<common name>\t<default?>\t<service count>
+#   <id> <description> <common name> <default?> <service count>, DSM_FS between
 dsm_cert_summary() {
     dsm_list_certs | jq -r '
         .data.certificates[]? |
@@ -96,7 +105,7 @@ dsm_cert_summary() {
           (.subject.common_name // ""),
           (if .is_default then "default" else "" end),
           ((.services // []) | length | tostring)
-        ] | @tsv'
+        ] | map(tostring) | join("\u001f")'
 }
 
 # dsm_cert_services <cert_id> — the full service objects a certificate serves.

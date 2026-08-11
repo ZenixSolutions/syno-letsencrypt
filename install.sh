@@ -449,7 +449,9 @@ choose_certificate() {
 
     say "This NAS currently has:"
     say ""
-    while IFS=$'\t' read -r id desc cn isdef nsvc; do
+    # IFS is DSM_FS (0x1F), not tab: `read` collapses runs of whitespace IFS
+    # characters, so an empty description shifts every later column.
+    while IFS="${DSM_FS}" read -r id desc cn isdef nsvc; do
         [ -n "${id}" ] || continue
         n=$((n + 1))
         ids+=("${id}")
@@ -517,7 +519,10 @@ choose_services() {
     local i=1
     local -a keys=() preset=()
 
-    while IFS=$'\t' read -r name sub svc old; do
+    # DSM_FS again, not tab: _old_id is empty for any unassigned service,
+    # which with a whitespace separator would shift it out of alignment and
+    # break the "currently: ..." annotation and the pre-selection with it.
+    while IFS="${DSM_FS}" read -r name sub svc old; do
         keys+=("${sub}/${svc}")
         local mark="   "
         if [ -n "${preselect}" ] && [ "${old}" = "${preselect}" ]; then
@@ -527,7 +532,10 @@ choose_services() {
             "${C_BOLD}" "${i}" "${C_RESET}" "${mark}" "${name}" \
             "${C_DIM}" "$([ -n "${old}" ] && echo "currently: ${old}" || echo "unassigned")" "${C_RESET}"
         i=$((i + 1))
-    done < <(printf '%s' "${svcs}" | jq -r '.[] | [ (.display_name // (.subscriber + "/" + .service)), .subscriber, .service, ._old_id ] | @tsv')
+    done < <(printf '%s' "${svcs}" | jq -r '.[]
+                | [ (.display_name // (.subscriber + "/" + .service)),
+                    .subscriber, .service, (._old_id // "") ]
+                | map(tostring) | join("\u001f")')
 
     say ""
     dim "Enter numbers separated by commas, or 'all', or 'none'."

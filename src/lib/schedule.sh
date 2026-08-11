@@ -135,7 +135,28 @@ sched_install() {
         sched_list_invalidate
     fi
 
-    existing="$(sched_find_task_id)"
+    # Find ours by command rather than by name, and collapse any duplicates.
+    # The stderr bug above caused a successful create to be read as a failure,
+    # so the loop fell through to the second API and created a second task --
+    # two renewals a night. Re-running the installer now heals that instead of
+    # requiring the user to know it happened.
+    local dupe
+    existing=""
+    for dupe in $(sched_find_ours | awk '$2 == "current" { print $1 }'); do
+        if [ -z "${existing}" ]; then
+            existing="${dupe}"
+            continue
+        fi
+        if /usr/syno/bin/synoschedtask --del "id=${dupe}" >/dev/null 2>&1; then
+            log_info "Removed duplicate renewal task ${dupe}."
+        else
+            log_warn "Duplicate renewal task ${dupe} could not be removed;"
+            log_warn "delete it in Control Panel > Task Scheduler."
+        fi
+        sched_list_invalidate
+    done
+    [ -n "${existing}" ] || existing="$(sched_find_task_id)"
+
     schedule="$(sched_schedule_json "${hour}" "${minute}")"
     extra="$(sched_extra_json "${email}")"
 
@@ -158,8 +179,17 @@ sched_install() {
             args+=(method=create)
         fi
 
-        if out="$(/usr/syno/bin/synowebapi "${args[@]}" 2>&1)" \
-           && printf '%s' "${out}" | jq -e '.success == true' >/dev/null 2>&1; then
+        # 2>/dev/null and strip to the first '{'. Capturing with 2>&1 merges
+        # synowebapi's "[Line 295] Exec WebAPI: ..." progress line into the
+        # JSON, jq cannot parse the result, and a call that SUCCEEDED is read
+        # as a failure -- whereupon the loop tries the next API and creates a
+        # second task. Measured: the installer reported it could not create
+        # the entry, having created it.
+        #
+        # dsm.sh documents this trap and wraps it in syno_api. This file did
+        # not use it.
+        out="$(/usr/syno/bin/synowebapi "${args[@]}" 2>/dev/null | sed -n '/^[[:space:]]*{/,$p')"
+        if printf '%s' "${out}" | jq -e '.success == true' >/dev/null 2>&1; then
             if [ -n "${existing}" ]; then
                 log_info "Updated the Task Scheduler entry (id ${existing})."
             else
@@ -241,6 +271,12 @@ sched_status() {
     fi
 
     printf 'Scheduled:    yes (Task Scheduler id %s)\n' "${current}"
+    local dupes
+    dupes="$(printf '%s\n' "${found}" | awk '$2 == "current"' | wc -l | tr -d ' ')"
+    if [ "${dupes}" -gt 1 ]; then
+        printf '              warning: %s tasks run this command — renewal runs\n' "${dupes}"
+        printf '              %s times a night. Re-run install.sh to collapse them.\n' "${dupes}"
+    fi
     if [ -n "${stale}" ]; then
         printf '              warning: task %s also runs the old command — delete it,\n' "${stale}"
         printf '              or renewal is attempted twice and fails once.\n'
