@@ -104,8 +104,17 @@ ui_progress() {
         case "${last}" in
             *"Obtaining bundled SAN certificate"*) stage="Requesting certificate" ;;
             *"Preparing to solve DNS-01"*)         stage="Preparing DNS challenge" ;;
-            *"new record for"*)                    stage="DNS record created" ;;
-            *"Waiting for DNS record propagation"*|*"Checking DNS record propagation"*)
+
+            # The countdown starts the moment the record exists, not when lego
+            # first mentions waiting. In --dns.propagation-wait mode lego says
+            # nothing at all while it sleeps, so keying the fill on a
+            # "Waiting for..." line would leave the logo frozen at zero for the
+            # whole wait.
+            *"new record for"*)
+                stage="Waiting for DNS to propagate"
+                [ "${pstart}" -eq 0 ] && pstart="${SECONDS}"
+                ;;
+            *"Waiting for DNS record propagation"*|*"Checking DNS record propagation"*|*"Wait for propagation"*)
                 stage="Waiting for DNS to propagate"
                 [ "${pstart}" -eq 0 ] && pstart="${SECONDS}"
                 ;;
@@ -114,6 +123,13 @@ ui_progress() {
             *"Deactivating auth"*)                 stage="Rolling back" ;;
             *) ;;
         esac
+
+        # Once the wait is over, lego is talking to Let's Encrypt. Say so rather
+        # than leaving "waiting for DNS" on screen at 100%.
+        if [ "${pstart}" -gt 0 ] && [ "${pct}" -ge 100 ] \
+           && [ "${stage}" = "Waiting for DNS to propagate" ]; then
+            stage="Validating with Let's Encrypt"
+        fi
 
         if [ "${pstart}" -gt 0 ]; then
             elapsed=$(( SECONDS - pstart ))

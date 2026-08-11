@@ -59,18 +59,32 @@ DNS_RESOLVERS="1.1.1.1:53 8.8.8.8:53"
 # progress display can show a real deadline instead of a guess.
 PROPAGATION_TIMEOUT="180"
 
-# Whether lego is allowed to confirm the challenge record itself.
+# Whether lego confirms the challenge record itself before asking Let's
+# Encrypt to validate.
 #
-#   check  lego queries the authoritative nameserver over port 53. Correct
-#          wherever public DNS is reachable.
-#   wait   lego skips its checks and waits PROPAGATION_WAIT seconds. Required
-#          where port-53 answers are intercepted: lego would otherwise wait for
-#          a record it can never be shown, however long the timeout. Let's
-#          Encrypt then validates from the public internet, which is the view
-#          that decides the outcome.
-#   auto   compare the two views over HTTPS and choose.
-PROPAGATION_MODE="auto"
-PROPAGATION_WAIT="60"
+#   wait   (default) lego creates the record, sleeps PROPAGATION_WAIT seconds,
+#          and hands over. Let's Encrypt then performs the validation that
+#          actually decides the outcome, from its own resolvers.
+#   check  lego polls the authoritative nameservers until it sees the record.
+#          Cheaper on failure -- a record that never appears costs a local
+#          timeout rather than one of Let's Encrypt's five failed validations
+#          per hostname per hour.
+#
+# Why wait is the default
+# -----------------------
+# lego's check is a rehearsal of what Let's Encrypt will do, and it is the
+# rehearsal that fails on a resolver holding a stale negative answer. Measured
+# on a real NAS: lego created the record and queried it two seconds later,
+# before Cloudflare was serving it. The resulting NXDOMAIN was cached for the
+# zone's SOA minimum of 1800 seconds, so every subsequent poll returned the
+# same stale answer and the challenge could never pass -- while the record was
+# live and visible to the entire rest of the internet, including Let's Encrypt.
+#
+# Not querying at all avoids creating that cached negative in the first place.
+# Let's Encrypt asks for the name for the first time, from resolvers that have
+# no reason to hold anything stale about it.
+PROPAGATION_MODE="wait"
+PROPAGATION_WAIT="120"
 
 
 # How DSM labels this certificate in Control Panel. Renewals match on it, so
@@ -172,25 +186,16 @@ run_lego() {
         lego_args+=(--dns.resolvers "${r}")
     done
 
-    local mode="${PROPAGATION_MODE}" rc=0
-    if [ "${mode}" = "auto" ]; then
-        dns_check_public_visible "$(primary_domain)" || rc=$?
-        case "${rc}" in
-            0) mode="check" ;;
-            1) log_warn "This NAS does not receive the public internet's answers for"
-               log_warn "$(primary_domain) over port 53. lego cannot confirm the challenge"
-               log_warn "record from here at any timeout, so its check is being skipped."
-               log_warn "Let's Encrypt will validate from outside the network."
-               mode="wait" ;;
-            *) log_warn "Could not compare local DNS against the public view."
-               log_warn "Skipping local propagation checks to be safe."
-               mode="wait" ;;
-        esac
-    fi
-
+    # No auto-detection. It was tried, and it compared nameserver lists -- which
+    # match perfectly on exactly the network where this fails, so it chose the
+    # broken mode. The signal that matters is not observable before the record
+    # exists.
+    local mode="${PROPAGATION_MODE}"
     if [ "${mode}" = "wait" ]; then
         lego_args+=(--dns.propagation-wait "${PROPAGATION_WAIT}s")
-        log_info "Waiting ${PROPAGATION_WAIT}s for the record, then handing over to Let's Encrypt."
+        log_info "Creating the DNS record, then waiting ${PROPAGATION_WAIT}s before"
+        log_info "Let's Encrypt validates it. The certificate is still fully verified;"
+        log_info "only lego's own local pre-check is skipped."
     fi
 
     mkdir -p "${LEGO_DATA}"

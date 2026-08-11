@@ -603,13 +603,16 @@ RENEW_DAYS="30"
 # intercepts port 53 — see PROPAGATION_MODE.
 DNS_RESOLVERS="1.1.1.1:53 8.8.8.8:53"
 
-# auto  = ask over HTTPS whether this NAS receives the public internet's DNS
-#         answers for this domain, and skip lego's local check when it does not.
-# check = always let lego confirm the record itself.
-# wait  = always skip lego's check and wait PROPAGATION_WAIT seconds, leaving
-#         verification to Let's Encrypt.
-PROPAGATION_MODE="auto"
-PROPAGATION_WAIT="60"
+# wait  = create the record, pause, and let Let's Encrypt do the verifying.
+#         The certificate is still fully validated by the CA; only lego's own
+#         local pre-check is skipped. This is the default because that
+#         pre-check fails on any resolver holding a stale negative answer for
+#         the challenge name -- see docs/architecture.md.
+# check  = let lego confirm the record itself first. Cheaper when something is
+#         genuinely wrong, since a failure costs a local timeout rather than
+#         one of Let's Encrypt's five failed validations per hostname per hour.
+PROPAGATION_MODE="wait"
+PROPAGATION_WAIT="120"
 
 # How DSM labels this certificate in Control Panel. Renewals match on it.
 CERT_DESC="${CERT_DESC_IN}"
