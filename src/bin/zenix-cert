@@ -59,6 +59,21 @@ SET_DEFAULT="true"
 RENEW_DAYS="30"
 DNS_RESOLVERS="1.1.1.1:53 8.8.8.8:53"
 
+# The key type lego generates, and therefore the key DSM is asked to import.
+#
+# RSA rather than lego's ec256 default. What is measured on DSM 7.3-86009:
+# an elliptic-curve key is refused by the certificate import with error 5511,
+# "illegal key file", in SEC1 form and in PKCS#8 form alike. DSM serves ECC
+# certificates perfectly well — it keeps ECC-cert.pem and RSA-cert.pem side by
+# side — so the limitation is in what this API accepts, not in what DSM can
+# use. Every other Synology ACME tool lands here too; it is why acme.sh users
+# are told to pass --keylength 2048 for Synology specifically.
+#
+# Configurable rather than hardcoded so a DSM release that lifts this does not
+# need a new version of this tool. lego accepts:
+# rsa2048, rsa3072, rsa4096, rsa8192, ec256, ec384.
+KEY_TYPE="rsa2048"
+
 # How long to wait for the challenge record to become visible on Cloudflare's
 # nameservers. Set explicitly rather than left to lego's default so the
 # progress display can show a real deadline instead of a guess.
@@ -106,6 +121,17 @@ load_config() {
     . "${CONFIG}"
     [ -n "${DOMAINS}" ]                  || die "No domains set in ${CONFIG}"
     [ -n "${CLOUDFLARE_DNS_API_TOKEN}" ] || die "No Cloudflare token set in ${CONFIG}"
+
+    # Caught here rather than left to lego, which reports an unknown key type
+    # only after the ACME account and order already exist — a wasted round
+    # trip, and on production a wasted rate-limit slot.
+    case "${KEY_TYPE}" in
+        rsa2048|rsa3072|rsa4096|rsa8192|ec256|ec384) ;;
+        *) die "KEY_TYPE=\"${KEY_TYPE}\" in ${CONFIG} is not a key type lego knows.
+   Valid: rsa2048, rsa3072, rsa4096, rsa8192, ec256, ec384.
+   DSM's certificate import rejects the ec* types; use rsa2048 unless you
+   have confirmed otherwise on your own DSM version." ;;
+    esac
 }
 
 # primary_domain — first entry in DOMAINS, wildcard prefix stripped. This is
@@ -177,6 +203,7 @@ run_lego() {
         --email "${ACME_EMAIL}"
         --dns cloudflare
         --path "${LEGO_DATA}"
+        --key-type "${KEY_TYPE}"
         "${domain_args[@]}"
     )
 
@@ -272,18 +299,14 @@ install_into_dsm() {
     leaf="$(mktemp)"; _TMPFILES+=("${leaf}")
     openssl x509 -in "${cert}" -out "${leaf}"
 
-    # DSM rejects SEC1 private keys with error 5511, "illegal key file".
-    # lego defaults to ec256 and writes EC keys in SEC1 form:
+    # Normalise the private key to PKCS#8 -----BEGIN PRIVATE KEY----- before
+    # handing it over, rather than lego's PKCS#1 -----BEGIN RSA PRIVATE KEY-----.
     #
-    #     -----BEGIN EC PRIVATE KEY-----
-    #
-    # whereas DSM accepts only PKCS#8:
-    #
-    #     -----BEGIN PRIVATE KEY-----
-    #
-    # The conversion is lossless, applies equally to RSA, and is a no-op on a
-    # key already in PKCS#8 — so it runs unconditionally rather than sniffing
-    # the header, and keeps working if the key type is ever changed.
+    # This is NOT what fixed error 5511: converting lego's EC key to PKCS#8
+    # was tried on hardware and DSM rejected it exactly as before. It stays
+    # because the conversion is lossless, is a no-op on a key already in that
+    # form, and costs one openssl call — one fewer variable in a code path
+    # that has already produced one wrong diagnosis.
     key8="$(mktemp)"; _TMPFILES+=("${key8}")
     openssl pkcs8 -topk8 -nocrypt -in "${key}" -out "${key8}" \
         || die "Could not convert the private key to PKCS#8 for DSM."

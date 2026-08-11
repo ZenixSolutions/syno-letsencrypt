@@ -620,6 +620,13 @@ RENEW_DAYS="30"
 # intercepts port 53 — see PROPAGATION_MODE.
 DNS_RESOLVERS="1.1.1.1:53 8.8.8.8:53"
 
+# RSA rather than lego's ec256 default: DSM's certificate import refuses an
+# elliptic-curve key with error 5511, "illegal key file", whatever encoding it
+# is offered in. DSM serves ECC certificates fine — it just will not accept one
+# through this API. Valid values: rsa2048, rsa3072, rsa4096, rsa8192, ec256,
+# ec384. Changing this takes effect on the next issue or renewal.
+KEY_TYPE="rsa2048"
+
 # wait  = create the record, pause, and let Let's Encrypt do the verifying.
 #         The certificate is still fully validated by the CA; only lego's own
 #         local pre-check is skipped. This is the default because that
