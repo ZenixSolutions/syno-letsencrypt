@@ -45,7 +45,7 @@ cf_api() {
         --header "Authorization: Bearer ${token}"
         --header "Content-Type: application/json"
     )
-    [ -n "${body}" ] && curl_args+=(--data "${body}")
+    if [ -n "${body}" ]; then curl_args+=(--data "${body}"); fi
 
     if ! response="$(curl "${curl_args[@]}" "${CF_API}${path}" 2>&1)"; then
         log_error "Cloudflare request failed (${method} ${path}): ${response}"

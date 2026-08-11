@@ -36,7 +36,7 @@ sched_schedule_json() {
 sched_extra_json() {
     local email="${1:-}"
     local notify=false
-    [ -n "${email}" ] && notify=true
+    if [ -n "${email}" ]; then notify=true; fi
     # notify_if_error keeps the mail to actual failures rather than a daily
     # "nothing to do" message nobody will keep reading.
     jq -nc --arg s "${SCHED_COMMAND}" --arg m "${email}" --argjson n "${notify}" \

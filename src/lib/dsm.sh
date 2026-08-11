@@ -185,7 +185,7 @@ dsm_import_cert() {
     else
         log_info "Creating a new certificate entry."
     fi
-    [ "${as_default}" = "true" ] && args+=(as_default=true)
+    if [ "${as_default}" = "true" ]; then args+=(as_default=true); fi
 
     out="$(syno_api "${args[@]}")"
     if ! syno_api_ok "${out}"; then

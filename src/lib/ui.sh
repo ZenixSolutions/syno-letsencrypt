@@ -46,7 +46,7 @@ ui_secs() {
 
 UI_LOGO_LINES=()
 ui_logo_load() {
-    [ ${#UI_LOGO_LINES[@]} -gt 0 ] && return 0
+    if [ ${#UI_LOGO_LINES[@]} -gt 0 ]; then return 0; fi
     [ -r "${UI_LOGO}" ] || return 1
     local l
     while IFS= read -r l || [ -n "${l}" ]; do UI_LOGO_LINES+=("${l}"); done < "${UI_LOGO}"
@@ -61,7 +61,9 @@ ui_logo_height() { printf '%s' "${#UI_LOGO_LINES[@]}"; }
 # the remainder dimmed, so it reads as a progress bar shaped like the logo.
 ui_logo_draw() {
     local pct="$1" line cut width=0 l
-    for l in "${UI_LOGO_LINES[@]}"; do [ "${#l}" -gt "${width}" ] && width="${#l}"; done
+    for l in "${UI_LOGO_LINES[@]}"; do
+        if [ "${#l}" -gt "${width}" ]; then width="${#l}"; fi
+    done
     cut=$(( width * pct / 100 ))
 
     for line in "${UI_LOGO_LINES[@]}"; do
@@ -93,8 +95,8 @@ ui_progress() {
     fi
 
     ui_logo_load || narrow=true
-    [ "$(ui_cols)" -lt 104 ] && narrow=true
-    [ "${narrow}" = false ] && height="$(ui_logo_height)"
+    if [ "$(ui_cols)" -lt 104 ]; then narrow=true; fi
+    if [ "${narrow}" = false ]; then height="$(ui_logo_height)"; fi
 
     printf '%s' "${UI_HIDE}"
 
@@ -112,11 +114,11 @@ ui_progress() {
             # whole wait.
             *"new record for"*)
                 stage="Waiting for DNS to propagate"
-                [ "${pstart}" -eq 0 ] && pstart="${SECONDS}"
+                if [ "${pstart}" -eq 0 ]; then pstart="${SECONDS}"; fi
                 ;;
             *"Waiting for DNS record propagation"*|*"Checking DNS record propagation"*|*"Wait for propagation"*)
                 stage="Waiting for DNS to propagate"
-                [ "${pstart}" -eq 0 ] && pstart="${SECONDS}"
+                if [ "${pstart}" -eq 0 ]; then pstart="${SECONDS}"; fi
                 ;;
             *"Cleaning DNS-01 challenge"*)         stage="Cleaning up DNS record" ;;
             *"Server responded with a certificate"*) stage="Certificate issued" ;;
@@ -134,11 +136,11 @@ ui_progress() {
         if [ "${pstart}" -gt 0 ]; then
             elapsed=$(( SECONDS - pstart ))
             pct=$(( elapsed * 100 / timeout ))
-            [ "${pct}" -gt 100 ] && pct=100
+            if [ "${pct}" -gt 100 ]; then pct=100; fi
         fi
 
         if [ "${narrow}" = false ]; then
-            [ "${drawn}" = true ] && printf '\033[%dA' $(( height + 3 ))
+            if [ "${drawn}" = true ]; then printf '\033[%dA' $(( height + 3 )); fi
             drawn=true
             printf '\033[2K\n'
             ui_logo_draw "${pct}"

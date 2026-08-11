@@ -1,47 +1,34 @@
 #!/usr/bin/env bash
-# dns.sh — reading public DNS from a network that intercepts port 53.
+# dns.sh — reading public DNS without going through the local resolver.
 #
-# The evidence
-# ------------
-# Measured on the target NAS. The same query, to the same public resolver, at
-# the same moment:
+# Why this exists
+# ---------------
+# A challenge record can be live and served correctly to the entire internet
+# while the machine that created it cannot see it. Measured on a real NAS:
 #
-#   From the NAS:
-#     nslookup -type=TXT _acme-challenge.files.example.com 1.1.1.1
-#     Server:  1.1.1.1
-#     ** server can't find _acme-challenge.files.example.com: NXDOMAIN
+#   * lego created the TXT record and queried it two seconds later, before
+#     Cloudflare was serving it;
+#   * the resulting NXDOMAIN was cached for the zone's SOA minimum of 1800
+#     seconds, so every later query returned the same stale negative;
+#   * a sibling record created one second afterwards, never queried early,
+#     resolved from that same NAS without trouble;
+#   * queried from two other networks, both records resolved immediately.
 #
-#   From a machine on another network:
-#     nslookup -type=TXT _acme-challenge.files.example.com 1.1.1.1
-#     Server:  1.1.1.1
-#     _acme-challenge.files.example.com  text = "poll-sub-1786416984"
+# Port 53 was not blocked or intercepted — that theory was tested and rejected.
+# The NAS resolved the zone's nameservers, its SOA, and other records in it
+# perfectly. Only the one name that had been asked for too early was affected.
 #
-# The record exists and Cloudflare serves it. The NAS addressed 1.1.1.1
-# explicitly and still got NXDOMAIN, so its port-53 packets never reached
-# 1.1.1.1 — something on the path answers them. Naming a different resolver
-# does not help, because the destination address is not what is being honoured.
+# What this file is for
+# ---------------------
+# DNS-over-HTTPS gives a view that a poisoned local cache cannot distort: a
+# different resolver, reached over port 443, with no history of the name in
+# question. That makes it the right tool for `check` and for diagnostics, where
+# the question is "what does the rest of the world see?" rather than "what does
+# this machine see?".
 #
-# Why this defeats lego on such a network
-# ---------------------------------------
-# lego must see the challenge record before it asks Let's Encrypt to validate.
-# It queries over port 53, so it receives the intercepted answer and waits for a
-# record that will never appear from its point of view. No timeout is long
-# enough; the answer does not change.
-#
-# What actually works
-# -------------------
-# DNS-over-HTTPS. An ordinary HTTPS request on port 443, authenticated by TLS,
-# which a port-53 redirect cannot touch and cannot forge. It is the only way
-# this NAS can obtain a truthful public DNS answer.
-#
-# lego cannot be made to use it, so the division of labour is:
-#   * this file  — establishes what public DNS really says, for `check`, for
-#                  diagnostics, and for deciding whether local checks are
-#                  trustworthy at all;
-#   * lego       — told to skip its own checks via --dns.propagation-wait, with
-#                  Let's Encrypt performing the verification that decides the
-#                  outcome, from the public internet where the record is plainly
-#                  visible.
+# It is deliberately NOT in the issuance path. lego cannot use DoH, and the fix
+# for issuance is not to look harder — it is to not look at all until Let's
+# Encrypt does, which is what --dns.propagation-wait achieves.
 
 readonly DOH_ENDPOINT="${DOH_ENDPOINT:-https://cloudflare-dns.com/dns-query}"
 readonly DOH_FALLBACK="${DOH_FALLBACK:-https://dns.google/resolve}"
@@ -111,7 +98,7 @@ dns_check_public_visible() {
     local_ns="$(dns_local_ns "${zone}")"
     [ -n "${local_ns}" ] || return 2
 
-    [ "${public}" = "${local_ns}" ] && return 0
+    if [ "${public}" = "${local_ns}" ]; then return 0; fi
 
     log_debug "public NS for ${zone}: $(printf '%s' "${public}" | tr '\n' ' ')"
     log_debug "local  NS for ${zone}: $(printf '%s' "${local_ns}" | tr '\n' ' ')"
@@ -141,7 +128,7 @@ dns_wait_for_txt() {
 
     while :; do
         elapsed=$(( SECONDS - start ))
-        [ "${elapsed}" -ge "${timeout}" ] && return 1
+        if [ "${elapsed}" -ge "${timeout}" ]; then return 1; fi
         if dns_doh_txt "${name}" 2>/dev/null | grep -qF "${expected}"; then
             printf '%s' "${elapsed}"
             return 0

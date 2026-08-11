@@ -177,7 +177,7 @@ ask() {
         fi
         IFS= read -r reply < "${TTY}" || die "No terminal available for input."
         reply="${reply:-${default}}"
-        [ -n "${reply}" ] && break
+        if [ -n "${reply}" ]; then break; fi
         printf '  (required)\n' > "${TTY}"
     done
     printf -v "${__var}" '%s' "${reply}"
@@ -189,7 +189,7 @@ ask_secret() {
         printf '%s: ' "${prompt}" > "${TTY}"
         IFS= read -r -s reply < "${TTY}" || die "No terminal available for input."
         printf '\n' > "${TTY}"
-        [ -n "${reply}" ] && break
+        if [ -n "${reply}" ]; then break; fi
         printf '  (required)\n' > "${TTY}"
     done
     printf -v "${__var}" '%s' "${reply}"
@@ -531,7 +531,7 @@ choose_services() {
 
     say ""
     dim "Enter numbers separated by commas, or 'all', or 'none'."
-    [ ${#preset[@]} -gt 0 ] && dim "Press Enter to keep the ones marked [x]."
+    if [ ${#preset[@]} -gt 0 ]; then dim "Press Enter to keep the ones marked [x]."; fi
     say ""
 
     local reply=""

@@ -164,7 +164,7 @@ run_lego() {
     IFS=',' read -ra _domains <<<"${DOMAINS}"
     for d in "${_domains[@]}"; do
         d="${d# }"; d="${d% }"
-        [ -n "${d}" ] && domain_args+=(--domains "${d}")
+        if [ -n "${d}" ]; then domain_args+=(--domains "${d}"); fi
     done
 
     lego_args=(
@@ -224,13 +224,21 @@ run_lego() {
         "${LEGO_BIN}" "${lego_args[@]}" "${action}" "$@" >"${log}" 2>&1 &
 
     local deadline="${PROPAGATION_TIMEOUT}"
-    [ "${mode}" = "wait" ] && deadline="${PROPAGATION_WAIT}"
-    ui_progress $! "${log}" "${deadline}"
-    rc=$?
+    if [ "${mode}" = "wait" ]; then deadline="${PROPAGATION_WAIT}"; fi
+
+    # `rc=$?` on its own line never runs if ui_progress returns non-zero:
+    # set -e terminates the script first, and lego's error is never printed.
+    rc=0
+    ui_progress $! "${log}" "${deadline}" || rc=$?
 
     if [ "${rc}" -ne 0 ]; then
-        log_error "lego failed. Full output:"
+        # Copy it somewhere the EXIT trap will not remove, so the failure can
+        # still be read after the process is gone.
+        local kept="${CONFIG_DIR}/last-error.log"
+        cp "${log}" "${kept}" 2>/dev/null && chmod 0600 "${kept}" 2>/dev/null
+        log_error "lego exited ${rc}. Full output:"
         sed 's/^/    /' "${log}" >&2
+        log_error "Saved to ${kept}"
     else
         # Keep the parts worth seeing; drop the propagation spam.
         grep -E "Server responded with a certificate|acme: Registering|Obtaining" "${log}" \
@@ -344,7 +352,7 @@ cmd_status() {
         printf 'Renewal:      due\n'
     fi
 
-    [ -f "${STATE}" ] && printf 'Last install: %s\n' "$(cat "${STATE}")"
+    if [ -f "${STATE}" ]; then printf 'Last install: %s\n' "$(cat "${STATE}")"; fi
 
     sched_status || true
 
@@ -363,7 +371,7 @@ usage() { sed -n '3,12p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
 
 main() {
     local cmd="${1:-}"
-    [ $# -gt 0 ] && shift
+    if [ $# -gt 0 ]; then shift; fi
     command -v jq >/dev/null 2>&1 || die "jq is required but not on PATH."
     case "${cmd}" in
         check)  cmd_check "$@" ;;

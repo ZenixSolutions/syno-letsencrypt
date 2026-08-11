@@ -13,7 +13,7 @@ set -euo pipefail
 [ "$(id -u)" -eq 0 ] || { echo "Run with sudo." >&2; exit 1; }
 
 PURGE=false
-[ "${1:-}" = "--purge" ] && PURGE=true
+if [ "${1:-}" = "--purge" ]; then PURGE=true; fi
 
 LIB_DIR="/usr/local/share/syno-letsencrypt/lib"
 if [ -r "${LIB_DIR}/log.sh" ]; then
