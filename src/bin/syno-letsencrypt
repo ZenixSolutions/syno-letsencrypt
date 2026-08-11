@@ -25,8 +25,6 @@ readonly LIB_DIR="${SYNOLE_LIB_DIR:-${SELF_DIR}/../share/syno-letsencrypt/lib}"
 . "${LIB_DIR}/dsm.sh"
 # shellcheck source=../lib/schedule.sh
 . "${LIB_DIR}/schedule.sh"
-# shellcheck source=../lib/dns.sh
-. "${LIB_DIR}/dns.sh"
 # shellcheck source=../lib/ui.sh
 . "${LIB_DIR}/ui.sh"
 
@@ -59,20 +57,6 @@ DNS_RESOLVERS="1.1.1.1:53 8.8.8.8:53"
 # progress display can show a real deadline instead of a guess.
 PROPAGATION_TIMEOUT="180"
 
-# How to establish that the challenge record is live before telling Let's
-# Encrypt to look.
-#
-#   check  lego queries the authoritative nameserver itself. Correct on a
-#          normal network.
-#   wait   lego skips its checks and waits PROPAGATION_WAIT seconds. Required
-#          where local DNS cannot see the public zone -- an Active Directory
-#          domain that shadows the public one, or a firewall redirecting
-#          outbound port 53 to an internal resolver. Let's Encrypt then does
-#          the only check that matters, from outside the network.
-#   auto   use `wait` if this NAS's view of the zone disagrees with the public
-#          one, otherwise `check`.
-PROPAGATION_MODE="auto"
-PROPAGATION_WAIT="60"
 
 # How DSM labels this certificate in Control Panel. Renewals match on it, so
 # they replace the existing entry rather than adding a new one every 60 days.
@@ -108,20 +92,6 @@ cmd_check() {
     log_info ""
 
     cf_check_token "${CLOUDFLARE_DNS_API_TOKEN}" "$(primary_domain)" >/dev/null || failed=1
-    log_info ""
-
-    log_info "Checking how this NAS resolves ${DOMAINS%%,*}..."
-    local zone; zone="$(primary_domain)"
-    local dns_rc=0
-    dns_check_split_horizon "${zone}" || dns_rc=$?
-    case "${dns_rc}" in
-        0) log_info "Local DNS agrees with the public internet." ;;
-        1) log_warn "Local DNS does NOT match the public view of this domain."
-           dns_describe_split_horizon "${zone}" >&2
-           log_warn "Propagation checks will be skipped; Let's Encrypt validates from outside." ;;
-        *) log_warn "Could not compare local DNS against the public view."
-           dns_describe_split_horizon "${zone}" >&2 ;;
-    esac
     log_info ""
 
     log_info "Checking DSM access..."
@@ -164,36 +134,13 @@ run_lego() {
     [ "${STAGING}" = "true" ] \
         && lego_args+=(--server https://acme-staging-v02.api.letsencrypt.org/directory)
 
-    # These govern CNAME resolution and apex determination only. lego's own
-    # documentation is explicit that the propagation check bypasses them:
-    # "For DNS-01 challenge verification, the authoritative DNS server is
-    # queried directly." Useful, but not sufficient on a hostile resolver.
+    # lego replaces its recursive nameserver list entirely with these; it does
+    # not consult /etc/resolv.conf. They are used to find the zone apex and the
+    # zone's NS records, after which lego queries the authoritative nameserver
+    # directly by address. The system resolver is never in the path.
     for r in ${DNS_RESOLVERS}; do
         lego_args+=(--dns.resolvers "${r}")
     done
-
-    local mode="${PROPAGATION_MODE}" rc=0
-    if [ "${mode}" = "auto" ]; then
-        dns_check_split_horizon "$(primary_domain)" || rc=$?
-        case "${rc}" in
-            0) mode="check" ;;
-            1) log_warn "This NAS resolves $(primary_domain) differently from the public internet."
-               log_warn "Its local propagation check would fail however long it waited, so it is"
-               log_warn "being skipped. Let's Encrypt validates from outside the network."
-               mode="wait" ;;
-            *) log_warn "Could not compare local DNS against the public view."
-               log_warn "Skipping local propagation checks to be safe."
-               mode="wait" ;;
-        esac
-    fi
-
-    if [ "${mode}" = "wait" ]; then
-        # Disables every local propagation check. The record still has to be
-        # live -- Let's Encrypt validates it from the public internet, which is
-        # the authority that actually decides.
-        lego_args+=(--dns.propagation-wait "${PROPAGATION_WAIT}s")
-        log_info "Skipping local DNS checks; waiting ${PROPAGATION_WAIT}s before validation."
-    fi
 
     mkdir -p "${LEGO_DATA}"
     chmod 700 "${LEGO_DATA}"
@@ -220,9 +167,7 @@ run_lego() {
     CLOUDFLARE_PROPAGATION_TIMEOUT="${PROPAGATION_TIMEOUT}" \
         "${LEGO_BIN}" "${lego_args[@]}" "${action}" "$@" >"${log}" 2>&1 &
 
-    local deadline="${PROPAGATION_TIMEOUT}"
-    [ "${mode}" = "wait" ] && deadline="${PROPAGATION_WAIT}"
-    ui_progress $! "${log}" "${deadline}"
+    ui_progress $! "${log}" "${PROPAGATION_TIMEOUT}"
     rc=$?
 
     if [ "${rc}" -ne 0 ]; then

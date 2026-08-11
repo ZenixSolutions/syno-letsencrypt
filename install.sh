@@ -285,7 +285,6 @@ readonly SOURCE_FILES=(
     "src/lib/cloudflare.sh"
     "src/lib/dsm.sh"
     "src/lib/schedule.sh"
-    "src/lib/dns.sh"
     "src/lib/ui.sh"
     "src/bin/syno-letsencrypt"
     "docs/banner.txt"
@@ -599,17 +598,9 @@ SET_DEFAULT="${SET_DEFAULT_IN}"
 # Renew when fewer than this many days remain.
 RENEW_DAYS="30"
 
-# Used for CNAME and apex lookups only. lego queries the authoritative
-# nameserver directly for the propagation check regardless of this setting.
+# lego uses these instead of /etc/resolv.conf to find the zone apex and the
+# zone's nameservers. It then queries the authoritative nameserver directly.
 DNS_RESOLVERS="1.1.1.1:53 8.8.8.8:53"
-
-# auto  = skip local propagation checks when this NAS resolves the domain
-#         differently from the public internet (Active Directory shadowing the
-#         same domain, or a firewall redirecting outbound port 53).
-# check = always let lego verify locally.
-# wait  = always skip local checks and wait PROPAGATION_WAIT seconds.
-PROPAGATION_MODE="${PROPAGATION_MODE_IN}"
-PROPAGATION_WAIT="60"
 
 # How DSM labels this certificate in Control Panel. Renewals match on it.
 CERT_DESC="${CERT_DESC_IN}"
@@ -706,7 +697,7 @@ main() {
     # Needs the tools in place first: the pickers read DSM state through jq.
     install_files
 
-    local CERT_MODE="replace" CERT_REPLACE_ID="" CERT_DESC_IN="" PROPAGATION_MODE_IN="auto"
+    local CERT_MODE="replace" CERT_REPLACE_ID="" CERT_DESC_IN=""
     CERT_DESC_IN="Let's Encrypt (${first})"
     choose_certificate
     choose_services
