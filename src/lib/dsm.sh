@@ -185,7 +185,18 @@ dsm_import_cert() {
     else
         log_info "Creating a new certificate entry."
     fi
-    if [ "${as_default}" = "true" ]; then args+=(as_default=true); fi
+    # as_default="true", quoted -- NOT the bare word true.
+    #
+    # Sent as a bare true it becomes a JSON boolean, and DSM answers 5511,
+    # "illegal key file", about a key it has not looked at. Measured by
+    # changing this one argument and nothing else: with it, refused; without
+    # it, the identical call succeeds. Quoted as a string it is accepted and
+    # is_default actually flips.
+    #
+    # This is the second parameter to hit the trap described above -- the
+    # first being certificate ids like 8ec29f37, which parse as scientific
+    # notation. Any value sent to this API wants deliberate quoting.
+    if [ "${as_default}" = "true" ]; then args+=("as_default=$(jstr true)"); fi
 
     out="$(syno_api "${args[@]}")"
     if ! syno_api_ok "${out}"; then
@@ -259,7 +270,14 @@ dsm_explain_error() {
         105)  printf 'the caller is not an administrator (105)' ;;
         5503) printf 'the service assignment payload was rejected (5503)' ;;
         5510) printf 'the certificate file was rejected as malformed (5510)' ;;
-        5511) printf 'the private key was rejected as malformed (5511)' ;;
+        # Nominally "illegal key file", and it does not mean that. DSM also
+        # returns 5511 when a parameter arrives with the wrong JSON type --
+        # as_default as a boolean rather than a quoted string produces it for
+        # a key DSM never examined. Say so, because taking this code at face
+        # value cost an evening and three confident wrong answers.
+        5511) printf 'rejected as an illegal key file (5511) -- but this code also
+   appears when an argument has the wrong JSON type, so check
+   docs/findings-dsm-cert-import.md before suspecting the key' ;;
         5512) printf 'the intermediate certificate was rejected (5512)' ;;
         5513) printf 'the certificate chain is incomplete (5513)' ;;
         5514) printf 'the private key does not match the certificate (5514)' ;;

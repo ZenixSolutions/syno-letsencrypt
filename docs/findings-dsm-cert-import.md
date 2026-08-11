@@ -25,15 +25,22 @@ difference nobody had listed.
 
 ## The actual rule
 
-`as_default=true` is refused. That is the whole finding.
+`as_default` must be a **quoted JSON string**. Sent as a bare `true` it becomes
+a JSON boolean and the call is refused.
 
     api=SYNO.Core.Certificate method=import version=1
         key_tmp=<path> cert_tmp=<path> inter_cert_tmp=<path>
         desc=<string> id=<cert id>
-        as_default=true              <-- 5511
+        as_default=true              <-- 5511, boolean
+        as_default="true"            <-- accepted, is_default flips
 
-Drop that one argument and the identical call succeeds, replacing the
-certificate in place and preserving its service assignments.
+Dropping the argument entirely also succeeds, which is what first isolated it:
+the identical call minus that one parameter replaced the certificate in place
+and preserved its service assignments.
+
+So there is no separate "set default" endpoint to find, and no workaround
+needed. The parameter was right, the type was wrong, and the error code named
+neither.
 
 ## What was ruled out, and stays ruled out
 
@@ -63,12 +70,14 @@ complaint:
 - A certificate id like `8ec29f37` is valid JSON — as **scientific notation**.
   String values must be explicitly quoted, which is what `jstr` in `dsm.sh` is
   for.
-- `as_default=true` arrives as a JSON **boolean**, not the string `"true"`.
+- `as_default=true` arrives as a JSON **boolean**, and DSM wants the string
+  `"true"`. Confirmed by `tools/probe-cert-default.sh`: the quoted form was the
+  first thing it tried and it worked, verified by reading `is_default` back
+  rather than trusting `success: true`.
 
-Whether the second one is the reason `as_default` is rejected is the open
-question `tools/probe-cert-default.sh` exists to answer. If it is, this is the
-same mistake in two different parameters, and worth checking for in any
-parameter added later.
+That is the same mistake in two different parameters. **Assume every value
+sent to this API needs deliberate quoting** until proven otherwise, and be
+suspicious of any parameter whose natural form is a boolean or a bare number.
 
 ## Reading errors from this API
 
@@ -84,7 +93,7 @@ Known codes, with the caveat that 5511 demonstrably lies:
 | 105 | caller is not an administrator | yes |
 | 5503 | service assignment payload rejected | yes |
 | 5510 | certificate file malformed | untested |
-| 5511 | private key malformed | **no** — also means `as_default` was sent |
+| 5511 | private key malformed | **no** — also means an argument had the wrong JSON type |
 | 5512 | intermediate certificate rejected | untested |
 | 5513 | incomplete chain | untested |
 | 5514 | key does not match certificate | untested |
