@@ -258,7 +258,7 @@ cert_paths() {
 }
 
 install_into_dsm() {
-    local cert key chain leaf target new_id
+    local cert key chain leaf key8 target new_id
     read -r cert key chain <<<"$(cert_paths)"
     [ -f "${cert}" ] || die "No certificate at ${cert}"
 
@@ -266,6 +266,22 @@ install_into_dsm() {
     # give it just the first certificate rather than a bundle.
     leaf="$(mktemp)"; _TMPFILES+=("${leaf}")
     openssl x509 -in "${cert}" -out "${leaf}"
+
+    # DSM rejects SEC1 private keys with error 5511, "illegal key file".
+    # lego defaults to ec256 and writes EC keys in SEC1 form:
+    #
+    #     -----BEGIN EC PRIVATE KEY-----
+    #
+    # whereas DSM accepts only PKCS#8:
+    #
+    #     -----BEGIN PRIVATE KEY-----
+    #
+    # The conversion is lossless, applies equally to RSA, and is a no-op on a
+    # key already in PKCS#8 — so it runs unconditionally rather than sniffing
+    # the header, and keeps working if the key type is ever changed.
+    key8="$(mktemp)"; _TMPFILES+=("${key8}")
+    openssl pkcs8 -topk8 -nocrypt -in "${key}" -out "${key8}" \
+        || die "Could not convert the private key to PKCS#8 for DSM."
 
     # Decide what we are updating. Order matters:
     #   1. a certificate we previously created, found by description — this is
@@ -277,7 +293,7 @@ install_into_dsm() {
         target="${CERT_REPLACE_ID}"
     fi
 
-    new_id="$(dsm_import_cert "${leaf}" "${key}" "${chain}" \
+    new_id="$(dsm_import_cert "${leaf}" "${key8}" "${chain}" \
                 "${CERT_DESC}" "${SET_DEFAULT}" "${target}")"
 
     # Replacing preserves services automatically. A new entry does not, and
