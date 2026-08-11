@@ -25,6 +25,8 @@ readonly LIB_DIR="${SYNOLE_LIB_DIR:-${SELF_DIR}/../share/syno-letsencrypt/lib}"
 . "${LIB_DIR}/dsm.sh"
 # shellcheck source=../lib/schedule.sh
 . "${LIB_DIR}/schedule.sh"
+# shellcheck source=../lib/dns.sh
+. "${LIB_DIR}/dns.sh"
 # shellcheck source=../lib/ui.sh
 . "${LIB_DIR}/ui.sh"
 
@@ -56,6 +58,19 @@ DNS_RESOLVERS="1.1.1.1:53 8.8.8.8:53"
 # nameservers. Set explicitly rather than left to lego's default so the
 # progress display can show a real deadline instead of a guess.
 PROPAGATION_TIMEOUT="180"
+
+# Whether lego is allowed to confirm the challenge record itself.
+#
+#   check  lego queries the authoritative nameserver over port 53. Correct
+#          wherever public DNS is reachable.
+#   wait   lego skips its checks and waits PROPAGATION_WAIT seconds. Required
+#          where port-53 answers are intercepted: lego would otherwise wait for
+#          a record it can never be shown, however long the timeout. Let's
+#          Encrypt then validates from the public internet, which is the view
+#          that decides the outcome.
+#   auto   compare the two views over HTTPS and choose.
+PROPAGATION_MODE="auto"
+PROPAGATION_WAIT="60"
 
 
 # How DSM labels this certificate in Control Panel. Renewals match on it, so
@@ -92,6 +107,21 @@ cmd_check() {
     log_info ""
 
     cf_check_token "${CLOUDFLARE_DNS_API_TOKEN}" "$(primary_domain)" >/dev/null || failed=1
+    log_info ""
+
+    log_info "Checking whether this NAS can see public DNS..."
+    local zone dns_rc=0
+    zone="$(primary_domain)"
+    dns_check_public_visible "${zone}" || dns_rc=$?
+    case "${dns_rc}" in
+        0) log_info "Port-53 answers match the public view." ;;
+        1) log_warn "Port-53 answers do NOT match the public view of this domain."
+           dns_describe_view "${zone}" >&2
+           log_warn "Local propagation checks will be skipped; Let's Encrypt validates"
+           log_warn "from outside, where the record is visible." ;;
+        *) log_warn "Could not compare local DNS against the public view."
+           dns_describe_view "${zone}" >&2 ;;
+    esac
     log_info ""
 
     log_info "Checking DSM access..."
@@ -135,12 +165,33 @@ run_lego() {
         && lego_args+=(--server https://acme-staging-v02.api.letsencrypt.org/directory)
 
     # lego replaces its recursive nameserver list entirely with these; it does
-    # not consult /etc/resolv.conf. They are used to find the zone apex and the
-    # zone's NS records, after which lego queries the authoritative nameserver
-    # directly by address. The system resolver is never in the path.
+    # not consult /etc/resolv.conf. Note this is not sufficient on a network
+    # that intercepts port 53 — naming a public resolver does not help when the
+    # destination address is not what is honoured.
     for r in ${DNS_RESOLVERS}; do
         lego_args+=(--dns.resolvers "${r}")
     done
+
+    local mode="${PROPAGATION_MODE}" rc=0
+    if [ "${mode}" = "auto" ]; then
+        dns_check_public_visible "$(primary_domain)" || rc=$?
+        case "${rc}" in
+            0) mode="check" ;;
+            1) log_warn "This NAS does not receive the public internet's answers for"
+               log_warn "$(primary_domain) over port 53. lego cannot confirm the challenge"
+               log_warn "record from here at any timeout, so its check is being skipped."
+               log_warn "Let's Encrypt will validate from outside the network."
+               mode="wait" ;;
+            *) log_warn "Could not compare local DNS against the public view."
+               log_warn "Skipping local propagation checks to be safe."
+               mode="wait" ;;
+        esac
+    fi
+
+    if [ "${mode}" = "wait" ]; then
+        lego_args+=(--dns.propagation-wait "${PROPAGATION_WAIT}s")
+        log_info "Waiting ${PROPAGATION_WAIT}s for the record, then handing over to Let's Encrypt."
+    fi
 
     mkdir -p "${LEGO_DATA}"
     chmod 700 "${LEGO_DATA}"
@@ -167,7 +218,9 @@ run_lego() {
     CLOUDFLARE_PROPAGATION_TIMEOUT="${PROPAGATION_TIMEOUT}" \
         "${LEGO_BIN}" "${lego_args[@]}" "${action}" "$@" >"${log}" 2>&1 &
 
-    ui_progress $! "${log}" "${PROPAGATION_TIMEOUT}"
+    local deadline="${PROPAGATION_TIMEOUT}"
+    [ "${mode}" = "wait" ] && deadline="${PROPAGATION_WAIT}"
+    ui_progress $! "${log}" "${deadline}"
     rc=$?
 
     if [ "${rc}" -ne 0 ]; then

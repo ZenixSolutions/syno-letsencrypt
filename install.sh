@@ -285,6 +285,7 @@ readonly SOURCE_FILES=(
     "src/lib/cloudflare.sh"
     "src/lib/dsm.sh"
     "src/lib/schedule.sh"
+    "src/lib/dns.sh"
     "src/lib/ui.sh"
     "src/bin/syno-letsencrypt"
     "docs/banner.txt"
@@ -598,9 +599,17 @@ SET_DEFAULT="${SET_DEFAULT_IN}"
 # Renew when fewer than this many days remain.
 RENEW_DAYS="30"
 
-# lego uses these instead of /etc/resolv.conf to find the zone apex and the
-# zone's nameservers. It then queries the authoritative nameserver directly.
+# lego uses these instead of /etc/resolv.conf. Not sufficient on a network that
+# intercepts port 53 — see PROPAGATION_MODE.
 DNS_RESOLVERS="1.1.1.1:53 8.8.8.8:53"
+
+# auto  = ask over HTTPS whether this NAS receives the public internet's DNS
+#         answers for this domain, and skip lego's local check when it does not.
+# check = always let lego confirm the record itself.
+# wait  = always skip lego's check and wait PROPAGATION_WAIT seconds, leaving
+#         verification to Let's Encrypt.
+PROPAGATION_MODE="auto"
+PROPAGATION_WAIT="60"
 
 # How DSM labels this certificate in Control Panel. Renewals match on it.
 CERT_DESC="${CERT_DESC_IN}"
