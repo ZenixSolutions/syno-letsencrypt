@@ -25,6 +25,19 @@
 readonly DSM_CERT_ARCHIVE="/usr/syno/etc/certificate/_archive"
 readonly SYNOWEBAPI="/usr/syno/bin/synowebapi"
 
+# Services no imported certificate can take over.
+#
+# QuickConnect is served by the Synology-issued certificate for
+# <name>.direct.quickconnect.to -- a domain nobody else can be issued a
+# certificate for, so pointing it at ours would break it even if DSM allowed
+# it. DSM does not allow it: the reassignment is accepted, reported as a
+# success, and silently not performed. Measured -- nine services requested,
+# eight moved, no error anywhere.
+#
+# Excluded from the picker rather than left to fail, because a certificate
+# that cannot work there is not a choice worth offering.
+readonly DSM_UNASSIGNABLE='["system/quickconnect"]'
+
 # --------------------------------------------------------------------------
 # Calling synowebapi safely
 # --------------------------------------------------------------------------
@@ -124,13 +137,17 @@ dsm_services_with_owner() {
     certs="$(dsm_list_certs)"
     all="$(dsm_all_services)"
 
-    jq -n --argjson all "${all}" --argjson certs "${certs}" '
+    jq -n --argjson all "${all}" --argjson certs "${certs}" \
+          --argjson skip "${DSM_UNASSIGNABLE}" '
         # service key -> owning certificate id
         ($certs.data.certificates // []) as $c
         | ( [ $c[] | .id as $id | (.services // [])[] | { key: (.subscriber + "/" + .service), value: $id } ]
             | from_entries ) as $owner
         | [ $all[]
-            | . + { _old_id: ($owner[(.subscriber + "/" + .service)] // "") } ]
+            | . as $s
+            | ($s.subscriber + "/" + $s.service) as $k
+            | select( ($skip | index($k)) == null )
+            | $s + { _old_id: ($owner[$k] // "") } ]
     ' 2>/dev/null || printf '[]'
 }
 
@@ -255,9 +272,33 @@ dsm_assign_services() {
 
     # success:true is not sufficient here — this API has a history of
     # reporting success while changing nothing. Verify against a fresh read.
-    local actual
-    actual="$(dsm_cert_services "${new_id}" | jq 'length')"
-    log_info "Certificate ${new_id} now serves ${actual} service(s)."
+    local got missing
+    got="$(dsm_cert_services "${new_id}")"
+    log_info "Certificate ${new_id} now serves $(printf '%s' "${got}" | jq 'length') service(s)."
+
+    # Name what did not move, rather than leaving the user to notice that the
+    # count they were promised is not the count they got. A silent refusal
+    # that shows up only as "9 requested, 8 assigned" is a bug report nobody
+    # can act on.
+    #
+    # `as $k` matters: inside ($have | index(.)) the input is rebound to
+    # $have, so the bare form compares the array against itself and returns
+    # an empty list every time — reporting "nothing missing" forever. Same
+    # scoping trap as cloudflare.sh and services_wanted.
+    missing="$(jq -n --argjson want "${services}" --argjson got "${got}" '
+        ($got | map(.subscriber + "/" + .service)) as $have
+        | [ $want[]
+            | (.subscriber + "/" + .service) as $k
+            | select( ($have | index($k)) == null )
+            | $k ]' 2>/dev/null || printf '[]')"
+
+    if [ "$(printf '%s' "${missing}" | jq 'length')" -gt 0 ]; then
+        log_warn "DSM did not move these, and did not say why:"
+        printf '%s' "${missing}" | jq -r '.[]' | while IFS= read -r m; do
+            log_warn "    ${m}"
+        done
+        log_warn "Assign them by hand in Control Panel > Security > Certificate."
+    fi
     return 0
 }
 

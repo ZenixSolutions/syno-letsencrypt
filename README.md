@@ -21,10 +21,11 @@ automatically.**
 
 No inbound ports need to be opened, and no DSM credentials are stored.
 
-> **Status: in development.** The DSM interfaces this depends on have been
-> verified on hardware running DSM 7.3, but a production certificate has not yet
-> been issued end to end. The installer defaults to the Let's Encrypt staging
-> environment; begin there.
+> **Status: working, lightly tested.** A production certificate has been issued,
+> imported into DSM, set as the system default and assigned to eight services on
+> hardware running DSM 7.3-86009. It has not yet survived an unattended renewal,
+> which is the next thing to prove. The installer defaults to the Let's Encrypt
+> staging environment; begin there.
 
 ---
 
@@ -84,6 +85,12 @@ This choice has consequences — see [below](#replace-or-create-new).
 **5. Which services should use it.** DSM Desktop, FTPS, VPN Server, Synology
 Drive, KMIP, and any other installed service. When replacing a certificate, the
 services it already serves are pre-selected.
+
+QuickConnect is deliberately absent from that list. It is served by the
+Synology-issued certificate for `<name>.direct.quickconnect.to`, a name no
+public CA will issue to anyone else, so it has to keep its own certificate.
+DSM refuses to reassign it — silently, reporting success and changing
+nothing — so offering it as a choice would only produce a puzzle.
 
 The installer then writes its configuration, creates the scheduled task, and
 offers to issue the certificate immediately.
@@ -157,6 +164,23 @@ and by DSM release.
 
 Renewals always replace in place, regardless of the choice made at install.
 
+### If DSM's own Let's Encrypt is already in use
+
+DSM has a built-in Let's Encrypt client, in Control Panel → Security →
+Certificate. A certificate it created is recognisable by an **empty
+description** and a real Let's Encrypt issuer.
+
+Both tools will happily renew, on separate schedules, and either may claim the
+system default. That is not a conflict that announces itself — it surfaces
+months later as a certificate that reverts after working fine.
+
+So after this tool's certificate is the default and serving the right services,
+**remove DSM's certificate and turn off its renewal.** Verify in a browser
+first; a certificate that still serves something cannot be deleted safely.
+
+Nothing here depends on DSM's built-in client being absent. It is a question of
+not leaving two things doing the same job.
+
 ---
 
 ## Usage
@@ -176,6 +200,18 @@ sudo zenix-cert issue     # force a fresh issuance
 Configuration is stored as plain shell at
 `/usr/local/etc/syno-letsencrypt/config`. It can be edited directly, followed by
 `zenix-cert check` to revalidate.
+
+Two settings there are worth knowing about:
+
+- `KEY_TYPE` defaults to `rsa2048` rather than lego's `ec256`. Both import into
+  DSM successfully; RSA is chosen for maximum client compatibility. Accepts
+  `rsa2048`, `rsa3072`, `rsa4096`, `rsa8192`, `ec256`, `ec384`, and rejects
+  anything else before contacting Let's Encrypt rather than after.
+- `PROPAGATION_MODE` defaults to `wait`, which creates the challenge record and
+  pauses rather than polling for it. The certificate is still fully validated by
+  Let's Encrypt; only lego's own local pre-check is skipped. This is the default
+  because that pre-check fails on any resolver holding a stale negative answer
+  for the challenge name — a real failure mode, and an unobvious one.
 
 ---
 
@@ -249,6 +285,17 @@ the system resolver, which fails on networks running Pi-hole, AdGuard,
 split-horizon DNS, or a router that hijacks port 53. The installer pins public
 resolvers for the challenge lookup to avoid this. Adjust `DNS_RESOLVERS` in the
 configuration file if a different resolver is required.
+
+**"rejected as an illegal key file (5511)"** — this error does not mean what it
+says. DSM also returns it when an argument reaches its API with the wrong JSON
+type, for a key it never looked at. Chasing the key is a dead end; the causes
+measured so far are recorded in
+[docs/findings-dsm-cert-import.md](docs/findings-dsm-cert-import.md).
+
+**"DSM did not move these, and did not say why"** — a service assignment was
+accepted and then not performed. DSM reports success in this case, so the tool
+re-reads the certificate afterwards and names anything that did not move.
+Assign those in Control Panel → Security → Certificate → Settings.
 
 **A service is still using the old certificate** — see
 [Replace or create new?](#replace-or-create-new). Reassign it in Control Panel →

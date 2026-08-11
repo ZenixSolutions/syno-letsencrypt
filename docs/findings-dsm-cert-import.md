@@ -79,6 +79,26 @@ That is the same mistake in two different parameters. **Assume every value
 sent to this API needs deliberate quoting** until proven otherwise, and be
 suspicious of any parameter whose natural form is a boolean or a bare number.
 
+## Service assignment refuses QuickConnect, silently
+
+`SYNO.Core.Certificate.Service` `set` will not move `system/quickconnect` to an
+imported certificate. It does not say so. The call returns `success: true`, no
+error code, and the service stays where it was.
+
+Measured: nine services requested, eight assigned, nothing reported.
+
+This is DSM being right — QuickConnect is served by the Synology-issued
+certificate for `<name>.direct.quickconnect.to`, and no public CA will issue
+anyone else a certificate for that name. Pointing it at ours would break it.
+
+Two consequences for this tool:
+
+- `system/quickconnect` is excluded from the service picker, in
+  `DSM_UNASSIGNABLE`. A choice that cannot work is not worth offering.
+- `dsm_assign_services` names the services that did not move rather than only
+  counting them. A silent refusal visible only as "9 requested, 8 assigned" is
+  something the user has no way to act on.
+
 ## Reading errors from this API
 
 `success: true` is not proof that anything changed. `SYNO.Core.Certificate.Service`
